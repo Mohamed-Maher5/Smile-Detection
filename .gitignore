@@ -1,0 +1,45 @@
+# Virtual environments
+venv/
+.venv/
+venv_test/
+
+# Data (large, not meant for version control)
+data/raw/
+data/processed/
+data/cache/
+data/eda/*.pkl
+
+# Downloaded model files
+models/detector/*.onnx
+models/detector/*.zip
+
+# Trained classifier artifacts (keep if small, ignore if large — check file size first)
+# models/classifier/*.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS/editor junk
+.DS_Store
+.vscode/
+*.egg-info/
+
+# Environment variables / secrets, if any
+.env
+
+# Runtime/detector model files (buffalo_sc ONNX assets downloaded at setup)
+livenees_models/
+
+# CatBoost training artifacts
+catboost_info/
+notebooks/catboost_info/
+
+# test / tooling caches
+.pytest_cache/
+.mypy_cache/
