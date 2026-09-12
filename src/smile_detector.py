@@ -3,7 +3,7 @@
 Carries the Stage-4 decision from `04_modeling.ipynb`:
   Model     : LogisticRegression (C=1), trained on the 4 final features
   Scaler    : fitted StandardScaler (applied before inference)
-  Decision  : predict_proba(smile) >= 0.5
+  Decision  : predict_proba(smile) >= bundle threshold (0.5 when threshold is None)
   Test F1   : 0.8839 (precision 0.9010) on the held-out df_test.
 """
 
@@ -24,6 +24,7 @@ _MODEL = _BUNDLE["model"]
 _SCALER = _BUNDLE["scaler"]
 _FEATURES = list(_BUNDLE["features"])
 _BUNDLE_TYPE = _BUNDLE["type"]
+_THRESHOLD = _BUNDLE.get("threshold")
 
 
 def _score_sample(feature_row: dict) -> tuple[bool, float | None]:
@@ -40,7 +41,8 @@ def _score_sample(feature_row: dict) -> tuple[bool, float | None]:
         row = _SCALER.transform(row)
     if _BUNDLE_TYPE == "sklearn":
         prob = float(_MODEL.predict_proba(row)[0, 1])
-        return bool(prob >= 0.5), prob
+        cut = 0.5 if _THRESHOLD is None else float(_THRESHOLD)
+        return bool(prob >= cut), prob
     # threshold bundle: a single-feature rule, model carries the decision value.
     raw = float(row[0, 0])
     return bool(raw >= float(_MODEL)), raw
@@ -78,6 +80,7 @@ def is_smiling(image: np.ndarray) -> bool:
     degenerate (NaN) features. The carried classifier is a C=1
     LogisticRegression + StandardScaler on
     ['mouth_eye_ratio', 'mouth_vertical_lift', 'mouth_nose_ratio', 'mouth_width']
-    (threshold: predict_proba >= 0.5; test F1 0.8839 / precision 0.9010).
+    (threshold: predict_proba >= bundle threshold; 0.5 default, currently 0.67;
+    test F1 0.8839 / precision 0.9010 at the default cutoff).
     """
     return detect_and_score(image)[0]
