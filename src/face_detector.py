@@ -27,7 +27,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ── Config ───────────────────────────────────────────────────────────────────
-MODELS_DIR  = "livenees_models"
+# Anchor to the repo root so the cached model is shared no matter the CWD
+# (running from notebooks/ must not spawn a second copy under notebooks/).
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODELS_DIR  = os.path.join(PROJECT_ROOT, "livenees_models")
 BUFFALO_DIR = os.path.join(MODELS_DIR, "buffalo_sc")
 DET_MODEL   = os.path.join(BUFFALO_DIR, "det_500m.onnx")
 BUFFALO_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip"

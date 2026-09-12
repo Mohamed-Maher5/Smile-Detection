@@ -9,10 +9,6 @@ data/processed/
 data/cache/
 data/eda/*.pkl
 
-# Downloaded model files
-models/detector/*.onnx
-models/detector/*.zip
-
 # Trained classifier artifacts (keep if small, ignore if large — check file size first)
 # models/classifier/*.pkl
 

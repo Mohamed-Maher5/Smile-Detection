@@ -26,17 +26,45 @@ _FEATURES = list(_BUNDLE["features"])
 _BUNDLE_TYPE = _BUNDLE["type"]
 
 
-def _predict_from_features(feature_row: dict) -> bool:
+def _score_sample(feature_row: dict) -> tuple[bool, float | None]:
+    """Return (prediction, decision score) for a single feature row.
+
+    For an ``sklearn`` bundle the score is the smile-class ``predict_proba``;
+    for a ``threshold`` bundle it is the raw single-feature value that the
+    rule thresholds on (there is no probability model).
+    """
     row = np.array([[feature_row[f] for f in _FEATURES]], dtype=float)
     if np.isnan(row).any():
-        return False
+        return False, None
     if _SCALER is not None:
         row = _SCALER.transform(row)
     if _BUNDLE_TYPE == "sklearn":
         prob = float(_MODEL.predict_proba(row)[0, 1])
-        return bool(prob >= 0.5)
+        return bool(prob >= 0.5), prob
     # threshold bundle: a single-feature rule, model carries the decision value.
-    return bool(row[0, 0] >= float(_MODEL))
+    raw = float(row[0, 0])
+    return bool(raw >= float(_MODEL)), raw
+
+
+def detect_and_score(image: np.ndarray) -> tuple[bool, np.ndarray | None, float | None, int]:
+    """Run the production pipeline and return (is_smiling, kps, score, n_faces).
+
+    Returns the judgement, the (5, 2) landmarks that produced it (None when
+    there is no usable single face), the decision score as reported by
+    :func:`_score_sample`, and the total number of faces SCRFD found (so the
+    webcam demo can display why the smile check was skipped when count != 1).
+
+    Callers like the webcam demo can render the exact landmarks and confidence
+    the model used without re-running detection.  is_smiling() returns False
+    for both zero-face and multi-face frames, but the count distinguishes them.
+    """
+    faces = detect_with_fallback(get_detector(), image)
+    n_faces = len(faces)
+    if n_faces != 1 or faces[0].kps is None:
+        return False, None, None, n_faces
+    kps = faces[0].kps
+    pred, score = _score_sample(extract_features(kps))
+    return pred, kps, score, n_faces
 
 
 def is_smiling(image: np.ndarray) -> bool:
@@ -52,12 +80,4 @@ def is_smiling(image: np.ndarray) -> bool:
     ['mouth_eye_ratio', 'mouth_vertical_lift', 'mouth_nose_ratio', 'mouth_width']
     (threshold: predict_proba >= 0.5; test F1 0.8839 / precision 0.9010).
     """
-    faces = detect_with_fallback(get_detector(), image)
-    if len(faces) != 1:
-        return False
-
-    kps = faces[0].kps
-    if kps is None:
-        return False
-
-    return _predict_from_features(extract_features(kps))
+    return detect_and_score(image)[0]

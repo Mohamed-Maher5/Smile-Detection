@@ -47,8 +47,6 @@ def extract_features(kps: np.ndarray) -> dict:
             "mouth_width": mouth_width,
             "inter_eye_dist": inter_eye_dist,
             "mouth_eye_ratio": nan,
-            "eye_midpoint_y": eye_midpoint_y,
-            "mouth_midpoint_y": mouth_midpoint_y,
             "mouth_vertical_lift": nan,
             "mouth_nose_ratio": nan,
         }
@@ -57,8 +55,6 @@ def extract_features(kps: np.ndarray) -> dict:
         "mouth_width": mouth_width,
         "inter_eye_dist": inter_eye_dist,
         "mouth_eye_ratio": mouth_width / inter_eye_dist,
-        "eye_midpoint_y": eye_midpoint_y,
-        "mouth_midpoint_y": mouth_midpoint_y,
         "mouth_vertical_lift": (eye_midpoint_y - mouth_midpoint_y) / inter_eye_dist,
         "mouth_nose_ratio": mouth_width / nose_to_eye_mid,
     }
