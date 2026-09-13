@@ -27,6 +27,16 @@ def extract_features(kps: np.ndarray) -> dict:
     the mouth corners lift toward or past the eye line.
 
     >>> DO NOT flip this sign without updating every downstream consumer. <<<
+
+    CANDIDATE FEATURES (see 03_feature_engineering.ipynb)
+    -----------------------------------------------------
+    • mouth_corner_angle   : the angle (in degrees) subtended at the nose by
+      the vectors to the left and right mouth corners.  Scale-invariant by
+      construction (ratio of norms cancels).
+    • mouth_symmetry       : |left_mouth_y - right_mouth_y| / inter_eye_dist.
+      Asymmetric mouth heights (one corner lifted) drive this away from zero.
+    • mouth_triangle_area  : 0.5 * |cross(v_left, v_right)| / inter_eye_dist^2,
+      the area of the nose–corner–corner triangle, normalized for scale.
     """
     assert kps.shape == (5, 2), f"Expected kps shape (5, 2), got {kps.shape}"
 
@@ -41,6 +51,25 @@ def extract_features(kps: np.ndarray) -> dict:
 
     nose_to_eye_mid = float(np.linalg.norm(nose - eye_midpoint))
 
+    # Vectors from nose to the mouth corners (image coords, y grows downward).
+    v_left = left_mouth - nose
+    v_right = right_mouth - nose
+
+    left_mouth_y, right_mouth_y = float(left_mouth[1]), float(right_mouth[1])
+
+    # Angle subtended at the nose between the two mouth-corner vectors.
+    n_left = float(np.linalg.norm(v_left))
+    n_right = float(np.linalg.norm(v_right))
+    if n_left > 0.0 and n_right > 0.0:
+        cos_ang = float(np.dot(v_left, v_right) / (n_left * n_right))
+        mouth_corner_angle = float(np.degrees(np.arccos(np.clip(cos_ang, -1.0, 1.0))))
+    else:
+        mouth_corner_angle = np.nan
+
+    # Triangle (nose, left corner, right corner) area via 2D scalar cross product.
+    cross_2d = float(v_left[0] * v_right[1] - v_left[1] * v_right[0])
+    triangle_area = 0.5 * abs(cross_2d)
+
     if inter_eye_dist == 0.0:
         nan = np.nan
         return {
@@ -49,6 +78,9 @@ def extract_features(kps: np.ndarray) -> dict:
             "mouth_eye_ratio": nan,
             "mouth_vertical_lift": nan,
             "mouth_nose_ratio": nan,
+            "mouth_corner_angle": nan,
+            "mouth_symmetry": nan,
+            "mouth_triangle_area": nan,
         }
 
     return {
@@ -57,4 +89,7 @@ def extract_features(kps: np.ndarray) -> dict:
         "mouth_eye_ratio": mouth_width / inter_eye_dist,
         "mouth_vertical_lift": (eye_midpoint_y - mouth_midpoint_y) / inter_eye_dist,
         "mouth_nose_ratio": mouth_width / nose_to_eye_mid,
+        "mouth_corner_angle": mouth_corner_angle,
+        "mouth_symmetry": abs(left_mouth_y - right_mouth_y) / inter_eye_dist,
+        "mouth_triangle_area": triangle_area / inter_eye_dist**2,
     }

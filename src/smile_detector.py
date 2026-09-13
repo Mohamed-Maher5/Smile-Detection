@@ -60,13 +60,28 @@ def detect_and_score(image: np.ndarray) -> tuple[bool, np.ndarray | None, float 
     the model used without re-running detection.  is_smiling() returns False
     for both zero-face and multi-face frames, but the count distinguishes them.
     """
+    return detect_and_score_detailed(image)[:4]
+
+
+def detect_and_score_detailed(
+    image: np.ndarray,
+) -> tuple[bool, np.ndarray | None, float | None, int, float | None]:
+    """Like :func:`detect_and_score` but also returns the SCRFD detection score.
+
+    The extra element (last) is ``faces[0].det_score`` — the detector's own
+    confidence for the single face that was classified, or ``None`` when there
+    is no usable single face.  It lets callers like the webcam demo apply a
+    low-confidence hold without re-running detection or touching
+    ``face_detector.py``.
+    """
     faces = detect_with_fallback(get_detector(), image)
     n_faces = len(faces)
     if n_faces != 1 or faces[0].kps is None:
-        return False, None, None, n_faces
+        return False, None, None, n_faces, None
     kps = faces[0].kps
+    det_score = float(faces[0].det_score)
     pred, score = _score_sample(extract_features(kps))
-    return pred, kps, score, n_faces
+    return pred, kps, score, n_faces, det_score
 
 
 def is_smiling(image: np.ndarray) -> bool:

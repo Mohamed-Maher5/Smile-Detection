@@ -49,11 +49,11 @@ def detect_with_fallback(detector, img: np.ndarray,
     one face the result is returned immediately — the fallback chain is
     **never** triggered for images that already have a detection.
 
-    Otherwise, each scale from ``scales`` is tried in two interleaved steps:
-    the plain center crop first, then — only if that exact scale failed — the
-    same crop converted to grayscale (3-channel).  This order recovers
-    e.g. file2669.jpg in 3 attempts instead of 8.  All scales are exhausted
-    before returning empty.
+    Otherwise the *whole, uncropped* image is retried in grayscale (3-channel)
+    before any cropping.  Only if that also finds nothing does each scale from
+    ``scales`` get tried in the interleaved sequence: the plain center crop
+    first, then — only if that exact scale failed — the same crop converted
+    to grayscale.  All scales are exhausted before returning empty.
     """
     faces, _ = detect_with_fallback_traced(detector, img, scales)
     return faces
@@ -65,16 +65,21 @@ def detect_with_fallback_traced(detector, img: np.ndarray,
     the (first non-empty) face list, for latency-path auditing.
 
     Returns ``(faces, path)`` where *path* is ``"direct"`` (first detect on the
-    original image), ``"crop_<scale>"`` (recovered by a plain zoom-crop),
-    ``"grayscale_crop_<scale>"`` (the interleaved grayscale attempt at that same
-    scale), or ``"none"`` when every stage failed.  Behavior otherwise matches
-    ``detect_with_fallback``.
+    original image), ``"grayscale_direct"`` (recovered by the grayscale
+    conversion of the full, uncropped image), ``"crop_<scale>"`` (recovered by
+    a plain zoom-crop), ``"grayscale_crop_<scale>"`` (the interleaved grayscale
+    attempt at that same scale), or ``"none"`` when every stage failed.
+    Behavior otherwise matches ``detect_with_fallback``.
     """
     faces = detector.detect(img)
     if faces:
         return faces, "direct"
 
     gray = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    faces = detector.detect(gray)
+    if faces:
+        return faces, "grayscale_direct"
+
     for scale in scales:
         cropped = zoom_crop(img, scale)
         faces = detector.detect(cropped)
