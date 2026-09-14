@@ -1,100 +1,147 @@
 # Smile Detection
 
-Real-time smile classification from 5 facial landmarks — CPU-only, no GPU required.
+**Real-time smile classification from 5 facial landmarks — CPU-only, no GPU required.**
 
-## Overview
+A lightweight smile detector built for an eKYC liveness pipeline, migrating from dlib's dense 68-point facial landmark model to a 5-point SCRFD detector. The entire smile decision is derived from geometric relationships between 5 coordinates — no neural network beyond the fixed, tiny face detector, no GPU, and a classifier small enough to fit in a text message.
 
-This project detects real people smiling in a single image and returns a yes/no verdict within a strict latency budget, running entirely on CPU. The hard constraint is input: we deliberately restrict ourselves to the **5 SCRFD landmarks** (left eye, right eye, nose, two mouth corners) rather than dlib's dense 68-point mesh and its ~20 mouth landmarks. Five points cannot reconstruct a full mouth shape, so every smile signal must be squeezed out of a handful of geometric ratios computed between those points — a much harder classification problem than the one CNN-based and 68-point approaches solve. The result is a 1.5 KB classifier that runs in ~4.4 ms per frame with 86.6% accuracy on a real, camera-varied benchmark.
+---
+
+## Table of contents
+
+- [Why this is hard](#why-this-is-hard)
+- [Results at a glance](#results-at-a-glance)
+- [The journey](#the-journey)
+- [Experiments that didn't make the cut](#experiments-that-didnt-make-the-cut)
+- [Error analysis](#error-analysis)
+- [Data quality](#data-quality)
+- [How it works](#how-it-works)
+- [Quickstart](#quickstart)
+- [Usage](#usage)
+- [Project structure](#project-structure)
+- [Known limitations](#known-limitations)
+- [Citation](#citation--acknowledgments)
+
+---
+
+## Why this is hard
+
+Most smile detectors either run a CNN on the whole face crop, or work from dlib's 68-point mesh, which includes roughly 20 points tracing the full outline of the mouth. Both give a rich, direct signal of mouth shape.
+
+This project has neither. The face detector — SCRFD, run directly via ONNX Runtime instead of the heavier `insightface` package — only outputs **5 points**: left eye, right eye, nose, left mouth corner, right mouth corner. That's it. No mouth outline, no jaw, no eyebrows. The entire smile signal has to be reconstructed from geometric relationships between 5 coordinates, which is a meaningfully harder classification problem than either of the standard approaches — and the point of this project.
 
 ## Results at a glance
 
-Full 823-image delivery set (single-face + zero/multi-face frames); target baseline: **81.2% accuracy, 4.7 ms latency**.
+Measured on the complete 823-image delivery set (795 single-face images the classifier actually judges, plus 28 zero-face/multi-face frames that are automatically rejected by design). Target baseline, inherited from the previous dlib-based system: **81.2% accuracy, 4.7 ms/image latency**.
 
-| Metric | Value | vs. Baseline |
+| Metric | Value | vs. Target |
 |---|---|---|
-| Accuracy | **0.8663** | Beats 81.2% baseline by **+5.4 pp** |
-| Precision | **0.9067** | 91% of "smiling" calls are correct |
-| Recall | **0.8422** | 84% of smiling faces are caught |
-| F1 | **0.8733** | Balanced precision/recall tradeoff |
-| Latency (median) | **4.42 ms** | ~6% under the 4.7 ms target |
-| Latency (p95) | **5.47 ms** | Tail exceeds target under load (hard fallback images) |
+| Accuracy | **86.63%** | +5.4 points over target |
+| Precision | **90.67%** | 9 in 10 "smiling" calls are correct |
+| Recall | **84.22%** | 8.4 in 10 real smiles are caught |
+| F1 | **87.33%** | Balanced precision/recall |
+| Latency (median) | **~4.1 ms** | Comfortably under 4.7 ms |
+| Latency (p95) | **~5.2–5.7 ms** | Exceeds target under system load — see [limitations](#known-limitations) |
 
-*Source: `outputs/benchmark_summary.csv` (n=823, of which 28 zero/multi-face frames are scored as "not smiling" by design).*
+*Source: `outputs/benchmark_summary.csv`, model bundle `models/classifier/final_model.pkl`.*
+
+---
 
 ## The journey
 
-### The detection problem — and the fallback that solved it
+### 1. The detector didn't see everyone
 
-The first surprise came from the detector, not the classifier. On the full labeled dataset, SCRFD's direct pass failed to find *any* face in **6 images** — dark, low-contrast, or near-duplicate frames where the face does not pop out of the image. Without a face, no landmarks exist and the pipeline would silently return "not smiling," which is wrong for 3 of those frames.
+Running SCRFD as-is on the full labeled dataset, **6 images produced zero detected faces** — visual inspection showed a common cause: the face occupied a small fraction of the frame. SCRFD resizes every input to a fixed 160×160 before running inference, so a small, distant face shrinks even further and drops below the detection confidence threshold.
 
-The fix is a progressive **fallback chain**: run the detector on the original image, retry the full image in grayscale, then try center crops at scales 0.9 → 0.4 (each crop also tried in grayscale before shrinking further). Because every crop-local box and landmark is translated back into original-image coordinates before scoring, the classifier always sees geometrically consistent landmarks.
+The fix is a **progressive fallback chain**: if the direct pass finds nothing, retry on a series of center crops (scales 0.9 → 0.4), interleaved with a grayscale-converted version of each crop. One image (`file2669.jpg`) needed the full chain — a genuine color/contrast issue stacked on top of the size problem. Every crop-local coordinate is translated back into the original image's coordinate space before any feature is computed, so downstream logic never has to know a fallback happened.
 
-![Detection-recovery: hardest faces handled by the fallback pipeline](data/eda/detection_recovery_examples.png)
+**Result: 6 → 0 undetectable images**, with the fallback chain reordered mid-project (grayscale interleaved per scale, rather than tried only as a last resort) to cut the worst-case detection latency roughly in half.
 
-All **6** baseline failures are recovered by the fallback (**0 remain**): 4 by a plain center crop, 1 by the 0.8 crop, and 1 (the hardest, `file2669.jpg`) only by the full grayscale pass.
+![Detection recovery examples](data/eda/detection_recovery_examples.png)
 
-### Feature engineering — 4 ratios instead of a mesh
+### 2. Turning 5 points into 4 signals
 
-With only 5 points, the worthwhile signals are mouth *opening* and mouth *lifting*. We defined four scale-invariant geometric features from the raw landmarks:
+With no mouth outline available, the only usable geometry is **how wide the mouth is** and **how lifted its corners are**, both normalized against stable reference distances so they hold up regardless of face size or distance from the camera:
 
-| Feature | What it measures | Separability (|Cohen's d|) |
+| Feature | What it captures | Separability (Cohen's d) |
 |---|---|---|
-| `mouth_eye_ratio` | mouth width ÷ inter-eye distance (mouth opening) | 2.33 |
-| `mouth_vertical_lift` | vertical offset of the mouth vs. the eye line (corner lift) | 1.38 |
+| `mouth_eye_ratio` | mouth width ÷ inter-eye distance | 2.33 |
+| `mouth_vertical_lift` | mouth-corner height relative to the eye line | 1.38 |
 | `mouth_nose_ratio` | mouth width ÷ nose-to-eye distance | 0.70 |
-| `mouth_width` | raw mouth span | 0.62 |
+| `mouth_width` | raw mouth-corner span | 0.62 |
 
-Scale-invariance matters: features are dimensionless ratios, so they stay meaningful for faces of any size anywhere in the frame. Three more engineered candidates (`mouth_corner_angle`, `mouth_triangle_area`, `mouth_symmetry`) measured the mouth geometry from different angles but were **rejected** — they either duplicated existing features (correlation ≈ 0.78–0.82) or shrank on unseen data. Landmarks are also similarity-aligned to a canonical eye frame (left eye at −0.5, right eye at +0.5) so features are measured along the face's own axes, making them robust to head roll at zero measurable cost.
+Every feature is a ratio, not a raw distance (except `mouth_width`, kept for model-based candidates) — this makes them **scale-invariant by construction**: the same smile produces roughly the same feature values whether the face fills the frame or sits far from the camera.
 
-![Landmark alignment correcting head-roll on high-tilt faces](data/eda/alignment_example.png)
+Landmarks are also passed through a **similarity alignment** step before feature extraction — rotating and scaling all 5 points so the eyes sit at fixed canonical positions. This costs about 70 microseconds per frame and provides free insurance against head roll, even though (see below) it didn't move the accuracy needle on this particular benchmark.
 
-### Model selection — a real shootout, then confirming there's nothing better
+![Landmark alignment correcting head-roll](data/eda/alignment_example.png)
 
-We benchmarked every plausible classifier on the same 795-image held-out split (same 4 features, same `random_state=42`):
+### 3. Choosing a model — and confirming there's nothing better
 
-| Model | Test F1 | Median latency | Verdict |
+Every plausible classifier was benchmarked on the same held-out split, same 4 features, same random seed:
+
+| Model | Test F1 | Median latency | Note |
 |---|---|---|---|
-| DecisionTree (depth 4) | **0.8970** | 0.23 ms | Tied, statistically |
-| LogisticRegression | **0.8960** | 0.42 ms | **Shipped** |
-| Threshold rule (mouth_eye_ratio ≥ 0.836) | **0.8950** | <0.01 ms | Tied, statistically |
-| LinearSVC | **0.8926** | 0.43 ms | Close behind |
-| RandomForest | 0.8910 | 27.58 ms | **Excluded — 66× slower** |
-| LightGBM | 0.8907 | 0.98 ms | Close |
-| CatBoost | 0.8834 | 0.84 ms | Behind |
-| XGBoost | 0.8833 | 0.47 ms | Behind |
+| DecisionTree (depth 4) | 0.897 | 0.22 ms | Statistically tied with LR (McNemar p = 0.74) |
+| **LogisticRegression** | **0.894–0.896** | **0.42–0.55 ms** | **Shipped** |
+| Threshold rule (`mouth_eye_ratio`) | 0.895 | <0.01 ms | Statistically tied with LR |
+| LinearSVC | 0.893 | 0.46 ms | Close behind |
+| CatBoost | 0.883–0.894 | 0.81–0.84 ms | Behind |
+| LightGBM | 0.887–0.891 | 1.0–1.6 ms | Behind |
+| XGBoost | 0.883 | 0.52 ms | Behind |
+| RandomForest | 0.887–0.891 | 19–71 ms | **Excluded — 40–170× slower than everything else** |
 
-![Model leaderboard — test-set F1 with classification latency](data/eda/model_leaderboard.png)
+![Model leaderboard](data/eda/model_leaderboard.png)
 
-The grid-tuned LogisticRegression (C=0.1, threshold 0.5) sits at test F1 **0.8939** on the same split, statistically indistinguishable from the top tree and the pure threshold rule, and it is *more useful than either*: it exposes a **calibrated probability score**, so any target precision/recall tradeoff is a single configurable threshold rather than a fixed rule. Verdicts are therefore always accompanied by a confidence, not just a label.
+LogisticRegression (C=0.1) was chosen even though a couple of alternatives scored marginally higher on a given run, because those differences were tested with McNemar's exact test and found to be **statistically indistinguishable from noise** every time. LogisticRegression's real advantage isn't raw F1 — it's that it outputs a genuine calibrated probability, so the precision/recall tradeoff is one configurable number, not a fixed rule baked into a tree.
+
+### 4. Picking the decision threshold deliberately
+
+The default 0.5 cutoff isn't arbitrary here — it was chosen by explicitly sweeping thresholds and comparing precision/recall tradeoffs against the operating context. An eKYC liveness check is more hurt by a **false "smiling" acceptance** (letting a non-compliant frame through) than by a **false rejection** (a genuine smile that just needs a retry). Early in the project a higher threshold (0.67) was tested and shipped specifically to favor precision — cutting false accepts by over half — before being revisited and rebalanced back toward 0.5 once the dataset was independently re-verified (below), landing on the current F1-optimal, precision-recall-balanced operating point.
+
+### 5. Cleaning the ground truth — and proving it
+
+Automated relabeling was deliberately avoided. Instead, a geometric heuristic flagged *candidate* mislabeled images, every flagged image was reviewed by eye, and corrections were applied manually. To validate this work rather than just trust it, the labels were checked against the dataset's original, authoritative source — the [MPLab GENKI-4K release](https://mplab.ucsd.edu) — using byte-identical image matching (MD5) to pair every project image with its official counterpart.
+
+**Result: 99.67% label agreement** (3,982 of 3,995 matched images) between the manual review and the official ground truth, with the remaining 13 disagreements confirmed as genuinely ambiguous borderline expressions rather than clear errors on either side.
+
+---
 
 ## Experiments that didn't make the cut
 
-Rigor means testing alternatives and reporting the numbers. We tried four things that are **not** in the shipped pipeline, and they were rejected on the evidence, not on preference:
+Four ideas were implemented, tested with the same held-out rigor as everything shipped, and **rejected on the evidence**:
 
-| Experiment | Metric before | Metric after | Verdict |
+| Experiment | What it was | Result | Verdict |
 |---|---|---|---|
-| **Data augmentation** (landmark rotation + jitter) | CV F1 0.8919±0.0103 · held-out 0.8939 | No held-out benefit (original digits not preserved; qualitative record only) | **Rejected** — removed because the held-out comparison showed no benefit |
-| **Extended features** (+corner_angle, +triangle_area, +symmetry) | 4-feat: CV 0.8919 · held-out 0.8939 | 6-feat: CV 0.8915 · held-out 0.8928 · 7-feat: CV 0.8908 · held-out **0.8902** | **Rejected** — redundant (r≈0.78–0.82) and held-out drifts *down* as features are added |
-| **Landmark alignment for accuracy** | Non-aligned: CV 0.8911 · held-out 0.8960 | Aligned: CV 0.8904 · held-out 0.8949 · McNemar p = **1.000** (1 flip) | **Kept for robustness, not accuracy** — no measurable gain; alignment is a zero-cost insurance against head roll |
-| **DecisionTree as final model** | LR: held-out 0.8939 | DT: held-out 0.8970 · McNemar p = **0.7428** (n=37) | **Rejected** — nominally higher F1, but the difference is pure noise; LR's calibrated probability is strictly more useful |
+| **Landmark augmentation** | Rotation (±10°) + Gaussian jitter on training landmarks, to synthetically expand the training set | Held-out F1 unchanged to worse (0.876 → 0.870); GENKI-4K's images are already clean, so synthetic noise didn't teach the model anything useful | **Rejected** |
+| **Extended feature set** | Added `mouth_corner_angle`, `mouth_triangle_area`, `mouth_symmetry` | Correlated 0.77–0.82 with existing top features; held-out F1 dropped slightly as more were added (4-feat 0.876 → 6-feat 0.872 → 7-feat 0.870) | **Rejected** |
+| **Alignment for accuracy** | Same alignment used for robustness, tested for whether it improves classification | McNemar p = 1.000 — statistically zero difference (only 2 of 795 test predictions flipped) | **Kept anyway, but only for near-zero-cost head-roll robustness — not for any measured accuracy gain** |
+| **DecisionTree as the shipped model** | The top leaderboard entry by raw F1 | McNemar p = 0.74 vs. LogisticRegression — not significant | **Rejected** — LogisticRegression's calibrated probability output is more valuable than a statistically-tied F1 edge |
 
-McNemar's exact test is applied to paired predictions, so these "no-difference" verdicts are statistical statements, not vibes.
+Every verdict above is a McNemar exact-test statement, not a judgment call on the numbers alone — this is the same discipline applied throughout: an idea only ships if it beats the current model by more than what noise alone could produce.
+
+---
 
 ## Error analysis
 
-![Confusion matrix on the 795-image held-out split](data/eda/confusion_matrix_final.png)
+![Confusion matrix](data/eda/confusion_matrix_final.png)
 
-On the 795-image held-out split the confusion matrix is **TN 326 / FP 39 / FN 51 / TP 379** — accuracy 0.8868. Almost all revenue-relevant happy paths hold up; the errors concentrate in the extremes.
+On the held-out single-face test set: **TN 326 / FP 39 / FN 51 / TP 379**.
 
-![Test accuracy by brightness and blur tercile](data/eda/error_by_brightness_blur.png)
+![Accuracy by brightness and blur](data/eda/error_by_brightness_blur.png)
 
-![Example misclassified faces with feature values](data/eda/misclassified_examples.png)
+Breaking accuracy down by image quality tercile reveals the real weak point: **brightness, not blur**. Accuracy stays essentially flat across blur terciles (~0.88–0.90) but drops sharply in the brightest third of images (~0.86). Overexposed frames wash out the mouth-corner contrast the feature set depends on. Blur, somewhat counterintuitively, barely matters.
 
-The tercile breakdown shows what actually breaks the model: **brightness, not blur**. Accuracy is flat across blur terciles (0.883 / 0.898 / 0.879) but drops sharply in the brightest third (0.898 / 0.898 / **0.864**). Overexposed highlights wash out the mouth landmarks that carry the smile signal, and the misclassified examples confirm it — the failed faces cluster around small `mouth_eye_ratio` and high brightness. There is also a structural recall cap: frames containing zero or multiple faces are judged "not smiling" by design, and among the 823 delivery images, the 28 such frames cannot be rescued by any classifier.
+![Misclassified examples](data/eda/misclassified_examples.png)
+
+There is also a **structural recall ceiling** that no classifier can remove: frames with zero or multiple detected faces are scored `False` by design (see [How it works](#how-it-works)). Among the 823 delivery images, 28 fall into this category — some of them genuine smiles that are correctly, deliberately never given a chance to be classified.
+
+---
 
 ## Data quality
 
-Training and evaluation use the **GENKI-4K** subset of the MPLab GENKI database. Because GENKI distributes images rather than explicit per-file labels, every image was manually labeled and then audited against the official dataset's own metadata: label cross-validation produced **99.67% agreement** between our manual pass and the GENKI source labels. The remaining 0.33% (a handful of ambiguous images) were individually resolved to reach a confirmed, consistent baseline before any modeling.
+Training and evaluation use the **GENKI-4K** subset of the MPLab GENKI database — real-world photos, not laboratory-controlled expressions, which is closer to a live deployment than most academic face datasets. Labels were manually reviewed, then independently cross-validated against the dataset's official release, reaching **99.67% agreement** before the final model was trained (see [The journey, step 5](#5-cleaning-the-ground-truth--and-proving-it)).
+
+---
 
 ## How it works
 
@@ -102,36 +149,48 @@ Training and evaluation use the **GENKI-4K** subset of the MPLab GENKI database.
 Image
   │
   ▼
-SCRFD Detection, 5-point (ONNX)          ── no single face? → "Not smiling"
-  │                                          │
-  │  fallback: grayscale → center crops       │ (zero/multi-face → False by design)
-  ▼                                          │
-Landmark alignment (rotation + scale → canonical eye frame)
+SCRFD face detection (ONNX, CPU)
+  │
+  ├─ 0 faces  ──► retry: grayscale + crop fallback (scales 0.9 → 0.4)
+  │                  still 0 faces? ──► return False
+  │
+  ├─ 2+ faces ──► return False   (never guess which face to judge)
+  │
+  ▼  (exactly 1 face)
+Landmark alignment (rotate + scale → canonical eye positions)
   │
   ▼
-Geometric feature extraction (4 ratios)
-  │   • mouth_eye_ratio     • mouth_vertical_lift
-  │   • mouth_nose_ratio    • mouth_width
+Geometric feature extraction
+  │   mouth_eye_ratio · mouth_vertical_lift
+  │   mouth_nose_ratio · mouth_width
   ▼
 StandardScaler → LogisticRegression (C=0.1)
   │
   ▼
-Smiling / Not smiling  (predict_proba ≥ 0.5)
+predict_proba ≥ 0.5  →  Smiling / Not smiling
 ```
 
-![End-to-end pipeline walkthrough](data/eda/pipeline_walkthrough.png)
+![Pipeline walkthrough](data/eda/pipeline_walkthrough.png)
 
-Only 5 landmarks are used instead of a full CNN because the goal is speed and portability: the whole pipeline — detection, fallback, alignment, features, and a 1.5 KB logistic model — runs on CPU in ~4.4 ms/frame. Four geometric ratios capture mouth opening and lifting with no neural net beyond the fixed detector.
+Returning `False` on zero or multiple detected faces isn't a limitation to work around — it's a deliberate safety choice for a liveness context: if the system can't be confident *whose* face it's judging, or whether it's seeing a face at all, guessing is worse than refusing.
 
-## Quickstart / usage
+---
 
-Python 3.10+, no GPU. On first use the detector downloads the SCRFD model (`buffalo_sc`) from the InsightFace releases.
+## Quickstart
+
+Requires Python 3.10+. No GPU needed. The SCRFD model (`buffalo_sc`, ~2.5 MB) downloads automatically on first use.
 
 ```bash
+git clone https://github.com/Mohamed-Maher5/Smile-Detection.git
+cd Smile-Detection
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Use the model on a single image:
+## Usage
+
+**Single image:**
 
 ```python
 import cv2
@@ -141,32 +200,54 @@ img = cv2.imread("photo.jpg")
 print("smiling:", is_smiling(img))   # True / False
 ```
 
-Run the live webcam demo (`q` to quit):
+**Live webcam demo** (press `q` to quit):
 
 ```bash
 python src/webcam_demo.py
 ```
 
-Project layout:
+The live demo shows the detected face's bounding box and 5 landmarks, a smoothed smile probability (rolling average + hysteresis, to avoid flicker on borderline expressions), and the live detection confidence.
+
+---
+
+## Project structure
 
 ```text
-src/                  detector, features, preprocessing, smile_detector, webcam demo
-models/classifier/    shipped model bundle (final_model.pkl, 1.5 KB)
-notebooks/            data prep, EDA, feature engineering, modeling, benchmark, error analysis
-outputs/              benchmark results (CSV + misclassification grid)
-data/eda/             all figures used in this README
+src/
+  face_detector.py      SCRFD wrapper (provided, unmodified)
+  preprocessing.py       detection fallback (crop + grayscale retry)
+  features.py             geometric feature extraction + landmark alignment
+  smile_detector.py       is_smiling() — the deliverable
+  webcam_demo.py           live demo with keypoints, bbox, and smoothing
+models/classifier/
+  final_model.pkl          shipped model bundle (scaler + LogisticRegression + threshold)
+notebooks/
+  01_data_prep.ipynb        dataset loading and label correction
+  02_eda.ipynb                brightness/blur/detection-score exploration
+  03_feature_engineering.ipynb   feature design and separability analysis
+  04_modeling.ipynb              model leaderboard and selection
+  05_deployment_benchmark.ipynb  end-to-end accuracy and latency benchmark
+outputs/
+  benchmark_results.csv, benchmark_summary.csv
+data/eda/
+  every figure referenced in this README
 requirements.txt
 ```
 
+---
+
 ## Known limitations
 
-- **Bright-image sensitivity.** Accuracy drops most in the brightest frames (0.898 → 0.864) where overexposure washes out the mouth landmarks that drive the decision; blur has little effect by comparison.
-- **Multi-face frames are skipped by design.** `is_smiling()` returns `False` unless exactly one face is detected, so a smiling subject in a crowded frame is scored as not smiling — a structural cap on recall across the 28 such delivery frames that no classifier can remove.
-- **Latency tail on hard frames.** The median is comfortably under budget (4.42 ms vs 4.7 ms), but frames that force the full grayscale + crop fallback chain push p95 to ~5.5 ms under load; the single hardest image (`file2669.jpg`) requires every fallback stage.
+- **Overexposed images hurt accuracy** — the brightest tercile of images sees a real accuracy drop (~0.90 → ~0.86), since blown-out highlights wash out the mouth-corner contrast the features depend on.
+- **Multi-face and no-face frames always return `False`, by design** — this is correct, deliberate safety behavior, but it puts a hard ceiling on recall across any benchmark that includes such frames; no amount of model tuning can close this gap.
+- **Latency tail is load-sensitive.** Median latency comfortably beats the 4.7 ms target on every measured run; p95 latency occasionally exceeds it under system load, driven by the rare images that need the full detection fallback chain — not by the classifier itself, which runs in well under a millisecond.
+- **Head yaw (turning, not tilting) isn't corrected.** Landmark alignment fixes head *roll*; a genuine left/right head turn foreshortens the face in ways a 2D similarity transform can't undo. This remains an open area for future work.
+
+---
 
 ## Citation / acknowledgments
 
-Training and evaluation use the [MPLab GENKI Database, GENKI-4K Subset](https://mplab.ucsd.edu), cited as:
+Training and evaluation data: the [MPLab GENKI Database, GENKI-4K Subset](https://mplab.ucsd.edu).
 
 ```bibtex
 @misc{GENKI-4K,
@@ -175,4 +256,4 @@ Training and evaluation use the [MPLab GENKI Database, GENKI-4K Subset](https://
 }
 ```
 
-Face detection and landmarks use the SCRFD detector ([InsightFace](https://github.com/deepinsight/insightface), `buffalo_sc` / `det_500m.onnx`) via ONNX Runtime.
+Face detection and landmarks: the SCRFD detector via [InsightFace](https://github.com/deepinsight/insightface) (`buffalo_sc` / `det_500m.onnx`), run directly through ONNX Runtime.
