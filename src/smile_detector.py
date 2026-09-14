@@ -1,10 +1,11 @@
-"""End-to-end smile detection: detector -> features -> trained model/threshold.
+"""End-to-end smile detection: detector -> align -> features -> model.
 
 Carries the Stage-4 decision from `04_modeling.ipynb`:
-  Model     : LogisticRegression (C=1), trained on the 4 final features
+  Model     : LogisticRegression (C=0.1), trained on the 4 final aligned features
   Scaler    : fitted StandardScaler (applied before inference)
   Decision  : predict_proba(smile) >= bundle threshold (0.5 when threshold is None)
-  Test F1   : 0.8839 (precision 0.9010) on the held-out df_test.
+  Test F1   : 0.8939 (precision 0.9067) on the held-out clean df_test (795);
+              0.8733 on the full 823-image delivery set.
 """
 
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from face_detector import get_detector
-from features import extract_features
+from features import align_kps, extract_features
 from preprocessing import detect_with_fallback
 
 BUNDLE_PATH = Path(__file__).resolve().parents[1] / "models" / "classifier" / "final_model.pkl"
@@ -80,7 +81,8 @@ def detect_and_score_detailed(
         return False, None, None, n_faces, None
     kps = faces[0].kps
     det_score = float(faces[0].det_score)
-    pred, score = _score_sample(extract_features(kps))
+    aligned_kps = align_kps(kps)
+    pred, score = _score_sample(extract_features(aligned_kps))
     return pred, kps, score, n_faces, det_score
 
 
@@ -88,14 +90,15 @@ def is_smiling(image: np.ndarray) -> bool:
     """Return True iff *image* contains exactly one face that is judged smiling.
 
     Pipeline: SCRFD landmark detection (with zoom-crop fallback) on the whole
-    image, then geometric features from the single face's 5 landmarks run
-    through the same scaler + classifier as training.
+    image, then the single face's 5 landmarks are similarity-aligned to the
+    canonical eye frame (:func:`features.align_kps`), and geometric features
+    from the aligned landmarks run through the same scaler + classifier as
+    training.
 
     False when there are zero or more than one faces, no usable landmarks, or
-    degenerate (NaN) features. The carried classifier is a C=1
+    degenerate (NaN) features. The carried classifier is a C=0.1
     LogisticRegression + StandardScaler on
     ['mouth_eye_ratio', 'mouth_vertical_lift', 'mouth_nose_ratio', 'mouth_width']
-    (threshold: predict_proba >= bundle threshold; 0.5 default, currently 0.67;
-    test F1 0.8839 / precision 0.9010 at the default cutoff).
+    (threshold: predict_proba >= bundle threshold; 0.5 default).
     """
     return detect_and_score(image)[0]

@@ -3,6 +3,49 @@
 import numpy as np
 
 
+def align_kps(kps: np.ndarray) -> np.ndarray:
+    """Similarity-align a (5, 2) landmarks array into the canonical eye frame.
+
+    Maps ``left_eye`` -> ``(-0.5, 0)`` and ``right_eye`` -> ``(0.5, 0)`` using
+    an in-plane similarity transform: translate the eye midpoint to the origin,
+    rotate the eye vector onto the +x axis, then uniformly scale so the
+    inter-eye distance becomes 1.  Rotation + uniform scale preserves all
+    distances and angles, so relative face geometry is unchanged — the output
+    is the input de-rotated / de-scaled / re-centered.
+
+    Aligning before :func:`extract_features` makes the features measured along
+    the face's own axes (perpendicular to the eye line) rather than the
+    image's y-axis, which is the intended robustness fix for head roll.
+
+    Parameters
+    ----------
+    kps : array-like of shape (5, 2)
+        Rows [left_eye, right_eye, nose, left_mouth, right_mouth] in image
+        pixel space.
+
+    Returns
+    -------
+    np.ndarray of shape (5, 2) aligned to the canonical frame (float64).
+    """
+    kps = np.asarray(kps, dtype=float)
+    if kps.shape != (5, 2):
+        raise ValueError(f"expected shape (5, 2), got {kps.shape}")
+    left_eye, right_eye = kps[0], kps[1]
+
+    midpoint = (left_eye + right_eye) / 2.0
+    centered = kps - midpoint  # eye midpoint -> origin
+
+    eye_vec = right_eye - left_eye
+    angle = np.arctan2(eye_vec[1], eye_vec[0])  # signed angle of eye vector
+    cth, sth = np.cos(-angle), np.sin(-angle)   # rotate by -angle -> +x axis
+    rot = np.array([[cth, -sth], [sth, cth]])
+    de_rotated = centered @ rot.T
+
+    scale = 1.0 / np.hypot(eye_vec[0], eye_vec[1])  # |eye|/2 -> 0.5 => 1/|eye|
+    aligned = de_rotated * scale
+    return aligned
+
+
 def extract_features(kps: np.ndarray) -> dict:
     """Extract scale-invariant geometric features from a (5, 2) landmark array.
 
