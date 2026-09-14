@@ -66,24 +66,28 @@ def detect_and_score(image: np.ndarray) -> tuple[bool, np.ndarray | None, float 
 
 def detect_and_score_detailed(
     image: np.ndarray,
-) -> tuple[bool, np.ndarray | None, float | None, int, float | None]:
-    """Like :func:`detect_and_score` but also returns the SCRFD detection score.
+) -> tuple[bool, np.ndarray | None, float | None, int, float | None, np.ndarray | None]:
+    """Like :func:`detect_and_score` but also returns the SCRFD detection score
+    and the detected face bounding box.
 
-    The extra element (last) is ``faces[0].det_score`` — the detector's own
-    confidence for the single face that was classified, or ``None`` when there
-    is no usable single face.  It lets callers like the webcam demo apply a
-    low-confidence hold without re-running detection or touching
-    ``face_detector.py``.
+    The second-to-last element (offset -2) is ``faces[0].det_score`` — the
+    detector's own confidence for the single face that was classified, or
+    ``None`` when there is no usable single face.  It lets callers like the
+    webcam demo apply a low-confidence hold without re-running detection or
+    touching ``face_detector.py``.  The last element is ``faces[0].bbox``
+    (SCRFD order: x1, y1, x2, y2) or ``None`` and lets the demo draw the face
+    bounding box overlay.
     """
     faces = detect_with_fallback(get_detector(), image)
     n_faces = len(faces)
     if n_faces != 1 or faces[0].kps is None:
-        return False, None, None, n_faces, None
+        return False, None, None, n_faces, None, None
     kps = faces[0].kps
     det_score = float(faces[0].det_score)
+    bbox = faces[0].bbox
     aligned_kps = align_kps(kps)
     pred, score = _score_sample(extract_features(aligned_kps))
-    return pred, kps, score, n_faces, det_score
+    return pred, kps, score, n_faces, det_score, bbox
 
 
 def is_smiling(image: np.ndarray) -> bool:

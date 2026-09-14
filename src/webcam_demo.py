@@ -23,12 +23,15 @@ from collections import deque
 import cv2
 import numpy as np
 
+from features import align_kps
 from smile_detector import detect_and_score_detailed
 
 # SCRFD landmark order (matches features.py): left eye, right eye, nose,
 # left mouth corner, right mouth corner.
 KPS_TAGS = ["LE", "RE", "N", "LM", "RM"]
-KPS_COLOR = (255, 255, 0)  # cyan (BGR)
+KPS_COLOR = (255, 255, 0)  # satured cyan (BGR) keypoint dots
+BBOX_COLOR = (255, 255, 200)  # light cyan-white (BGR) — distinct from dots and text
+BBOX_THICKNESS = 2
 
 # Stabilisation knobs (the underlying model/classification is not modified).
 SMILE_THRESHOLD = 0.5      # model's predict_proba decision point
@@ -79,6 +82,40 @@ def _status_overlay(n_faces: int, verdict: bool) -> tuple[str, tuple[int, int, i
     return ("SMILING" if verdict else "NOT SMILING"), (0, 255, 0) if verdict else (0, 0, 255), True
 
 
+def _draw_bbox(frame: np.ndarray, bbox: np.ndarray) -> None:
+    """Overlay the detected face bounding box as a thin rectangle."""
+    if bbox is None or len(bbox) != 4:
+        return
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    if not all(np.isfinite(v) for v in (x1, y1, x2, y2)):
+        return
+    pt1 = (int(round(x1)), int(round(y1)))
+    pt2 = (int(round(x2)), int(round(y2)))
+    if not (0 <= pt1[0] < frame.shape[1] and 0 <= pt1[1] < frame.shape[0]):
+        return
+    cv2.rectangle(frame, pt1, pt2, BBOX_COLOR, BBOX_THICKNESS, cv2.LINE_AA)
+
+
+def _draw_face_label(frame: np.ndarray, bbox: np.ndarray, label: str,
+                     color: tuple[int, int, int], scale: float = 1.0) -> None:
+    """Draw *label* just above the top edge of *bbox*, outlined for readability."""
+    if bbox is None or len(bbox) != 4:
+        return
+    x1 = float(bbox[0])
+    y1 = float(bbox[1])
+    if not (np.isfinite(x1) and np.isfinite(y1)):
+        return
+    thickness = 3 if scale >= 1.0 else 2
+    (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    # Anchor the text box so it sits above the face box, clamped to the frame.
+    tx = int(round(max(1, min(x1, frame.shape[1] - tw - 1))))
+    ty = int(round(max(th + 4, y1 - 8)))
+    # Dark backing panel so the label stays readable over bright regions.
+    cv2.rectangle(frame, (tx - 3, ty - th - 3),
+                  (tx + tw + 3, ty + 3), (0, 0, 0), -1)
+    cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
 def _draw_kps(frame: np.ndarray, kps: np.ndarray) -> None:
     """Overlay each landmark as a small cyan dot with its tag next to it."""
     for tag, (px, py) in zip(KPS_TAGS, kps):
@@ -91,6 +128,22 @@ def _draw_kps(frame: np.ndarray, kps: np.ndarray) -> None:
         cv2.circle(frame, (xi, yi), 4, KPS_COLOR, -1)
         cv2.putText(frame, tag, (xi + 6, yi - 6), cv2.FONT_HERSHEY_SIMPLEX,
                     0.4, KPS_COLOR, 1, cv2.LINE_AA)
+
+
+def _draw_aligned(frame: np.ndarray, aligned: np.ndarray) -> None:
+    """Overlay the aligned landmark coordinates (canonical eye frame) top-right."""
+    if aligned is None:
+        return
+    h, w = frame.shape[:2]
+    lines = [f"{tag}: " + ",".join(f"{c:+.3f}" for c in pt) for tag, pt in zip(KPS_TAGS, aligned)]
+    y0 = 40
+    line_h = 22
+    panel_h = line_h * len(lines) + 10
+    x0 = w - 240
+    cv2.rectangle(frame, (x0 - 6, y0 - 34), (w - 4, y0 + panel_h - 8), (0, 0, 0), -1)
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (x0, y0 + i * line_h), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 200), 1, cv2.LINE_AA)
 
 
 def main() -> int:
@@ -138,11 +191,16 @@ def main() -> int:
 
         try:
             t0 = time.perf_counter()
-            _, kps, raw, n_faces, det_score = detect_and_score_detailed(frame)
+            _, kps, raw, n_faces, det_score, bbox = detect_and_score_detailed(frame)
             latency_ms = (time.perf_counter() - t0) * 1e3
         except Exception as err:
             print(f"WARNING: is_smiling() failed on frame: {err!r}")
             continue
+
+        if kps is not None:
+            aligned = align_kps(kps)
+        else:
+            aligned = None
 
         # Upscale the display frame to at least 1280x720 (never downscale) so
         # the window size is decoupled from what the camera captures. Keypoints
@@ -156,9 +214,19 @@ def main() -> int:
                 kps = kps.copy()
                 kps[:, 0] *= sx
                 kps[:, 1] *= sy
+            if bbox is not None:
+                sx, sy = disp_w / orig_w, disp_h / orig_h
+                bbox = bbox.copy().astype(float)
+                bbox[0] *= sx
+                bbox[1] *= sy
+                bbox[2] *= sx
+                bbox[3] *= sy
+
+        _draw_bbox(frame, bbox)
 
         if kps is not None:
             _draw_kps(frame, kps)
+        _draw_aligned(frame, aligned)
 
         # Faces count from the same detection result driving classification, so
         # the screen shows why the smile check was skipped when count != 1
@@ -196,7 +264,13 @@ def main() -> int:
                 verdict = False
 
         label, color, show_prob = _status_overlay(n_faces, verdict)
-        cv2.putText(frame, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        # Full-frame status (NO FACE / MULTIPLE FACES) stays at the corner;
+        # the smile verdict is anchored to the face box so it follows the face.
+        if n_faces == 1 and bbox is not None:
+            _draw_face_label(frame, bbox, label, color, scale=1.0)
+        else:
+            cv2.putText(frame, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2, color, 3)
 
         cv2.putText(frame, faces_line, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
