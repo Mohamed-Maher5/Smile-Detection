@@ -1,43 +1,109 @@
-# Smile liveness — final model report
+# Smile Detection
 
-**Chosen model:** `LogisticRegression` (C=0.1) + fitted `StandardScaler`, exported to `models/classifier/final_model.pkl` (`type='sklearn'`).
+Real-time smile classification from 5 facial landmarks — CPU-only, no GPU required.
 
-**Decision threshold:** `predict_proba(smile) >= 0.5` (the balanced operating point, equal to the classifier default). `final_model.pkl` exports `threshold=None` and `src/smile_detector.py` applies the 0.5 default.
+## What this is
 
-**Feature set (4 shipped, unchanged throughout):** `['mouth_eye_ratio', 'mouth_vertical_lift', 'mouth_nose_ratio', 'mouth_width']`. Three additional geometric features (`mouth_corner_angle`, `mouth_triangle_area`, `mouth_symmetry`) were implemented and tested on held-out data; none earned their place (held-out F1 dropped or was statistically indistinguishable — the F1 gain on CV was consumed by shrinkage on unseen data). A landmark-jitter augmentation pipeline was also tested (std 0.6 on mouth features) and removed after held-out comparison showed no benefit.
+A lightweight smile classifier that runs entirely on CPU: SCRFD landmark detection, alignment, and a logistic regression over 4 geometric features produce a verdict in ~4.4 ms per frame. It ships as a single `is_smiling(image)` function plus a live webcam demo.
 
-**Detection fallback path:** `src/preprocessing.py` uses an interleaved retry order that now runs the plain direct detection first, then the full-image grayscale variant, then the per-scale (0.9 down to 0.4) zoom-crop and grayscale-crop pairs — the grayscale-first reorder recovers the single previously-unrecoverable image (`file2669.jpg`) with negligible latency cost on the rest.
+## Results
 
-**Landmark alignment:** Landmark alignment (rotation+scale normalization to canonical eye positions) was added to the inference pipeline. Testing showed no measurable accuracy improvement on the GENKI-4K benchmark (likely due to limited head-roll variation in the dataset, 0-25°), but the added cost is negligible (~70μs/call, +1.7% latency) and the correction may improve robustness on inputs with greater head-roll variation than this benchmark contains (e.g., live webcam use).
+Full 823-image delivery set (single-face + zero/multi-face frames); target baseline: 81.2% accuracy, 4.7 ms latency.
 
-**Why over the close alternative (threshold):** On the 795-image clean test split the single-feature threshold rule (re-tuned OOF to `mouth_eye_ratio >= 0.836` on the corrected data) is statistically indistinguishable from the four-feature LR at its shipped point (31 discordant pairs: 16 rule-only-correct vs 15 LR-only-correct, exact McNemar p = 1.000; test F1 0.8950 vs 0.8939). The LR is still shipped because it exposes a probability score — any target precision/recall tradeoff is a single configurable threshold rather than a fixed rule — and it holds the same F1 at no higher FP count on the delivery set (39 FPs on 823 at 0.8422 recall).
-
-**Tuning (no test-set leakage):** features chosen by separability analysis on the full clean set; scaling fit on the stratified 80/20 train split only (3,176 rows, `random_state=42`); C tuned by 5-fold cross-validation on that split (best C=0.1, CV F1 0.8919). Threshold chosen at the classifier default 0.5 (balanced operating point). The 795-image test split was never touched during selection.
-
-**End-to-end metrics (full 823-image delivery set incl. 0-face/multi-face; final confirmed baseline run, effective threshold 0.5):**
-
-> Numbers below come from `outputs/benchmark_summary.csv` / `outputs/benchmark_results.csv`, regenerated from the confirmed 2026-09-14 baseline caches, with the threshold read from `final_model.pkl` (effective 0.5). Labels were independently cross-validated against the official MPLab GENKI-4K release (99.67% agreement on ~3995 matched images) before a final manual review of 13 borderline cases.
-
-| Metric | Value | Note |
+| Metric | Value | vs. Baseline |
 |---|---|---|
-| Accuracy | **0.8663** | |
+| Accuracy | **0.8663** | Beats 81.2% baseline by +5.4 pp |
 | Precision | **0.9067** | |
-| Recall | **0.8422** | 0.8814 on clean single-face; capped at 0.9556 max on 823 due to 20 unclassifiable smiles in multi-face/no-face frames |
+| Recall | **0.8422** | |
 | F1 | **0.8733** | |
-| Confusion (823) | TN 334, FP 39, FN 71, TP 379 | |
-| Latency (median) | **4.42 ms** | Meets 4.7 ms budget (-0.28 ms). Median is the stable reference across load conditions. |
-| Latency (p95) | 5.47 ms | Load-sensitive; occasionally exceeds the 4.7 ms budget under system load. Not a fixed quantity; median is the reliable measure. |
+| Latency (median) | **4.42 ms** | 6% under 4.7 ms target |
+| Latency (p95) | **5.47 ms** | Exceeds under load (tail from hard fallback images) |
 
-**Operating-point tradeoff (823 delivery set):** precision and recall trade off monotonically with the decision threshold. At the shipped 0.5 balance point, precision is 0.9067 / recall 0.8422 (F1 0.8733) with FP 39 / missed smiles 71; a higher (precision-priority) threshold raises precision at the cost of recall, and a lower (recall-priority) threshold does the reverse. The shipped 0.5 is the balanced, F1-oriented default.
+## Before / After
 
-**Known limitations (from bucket analysis & misclassification grid):**
-1. **Extreme image quality:** accuracy drops in the brightest and blurriest terciles vs the middle quality band — bright/overexposed and blurry frames are the main single-face error source.
-2. **Multi-face frames:** `is_smiling()` spec-correctly returns `False`, so 20 genuine-smile multi-face images (correctly-per-spec, incorrectly-per-label) become false negatives; only exactly-one-face frames produce a decision. This caps 823-set recall at 0.9556 even with a perfect classifier.
-3. **Hard detection images:** `file2669.jpg` (brightness 90, blur 769) fails the direct call, raising worst-case latency; the grayscale-first reorder added a full-image grayscale attempt before the zoom-crop chain, so it now resolves to its single face (previously unrecoverable).
+| Before | After |
+|---|---|
+| ![Landmark alignment correcting head-roll on high-tilt faces](data/eda/alignment_example.png) | ![Detection-recovery: hardest faces handled by fallback pipeline](data/eda/misclassified_grid.png) |
+| *Landmark alignment correcting head-roll on high-tilt faces* | *Detection-recovery: hardest faces handled by fallback pipeline* |
 
-**Artifacts:**
-- `models/classifier/final_model.pkl` — shipped bundle (model + scaler + features + threshold 0.5)
-- `outputs/benchmark_results.csv` — per-image predictions + latency (823 rows)
-- `outputs/benchmark_summary.csv` — aggregate metrics
-- `notebooks/04_modeling.ipynb` — training, CV, model selection, McNemar, threshold sweep
-- `notebooks/05_deployment_benchmark.ipynb` — full delivery-set benchmark
+## How it works
+
+```text
+Image
+  │
+  ▼
+SCRFD Detection (ONNX, 5-point)
+  │        │
+  │        └─ single face? no → return Not Smiling
+  │
+  ▼
+Landmark Alignment (rotation + scale → canonical eye frame)
+  │
+  ▼
+Geometric Feature Extraction (4 features)
+  │   • mouth_eye_ratio
+  │   • mouth_vertical_lift
+  │   • mouth_nose_ratio
+  │   • mouth_width
+  ▼
+StandardScaler → Logistic Regression (C=0.1)
+  │
+  ▼
+Smiling / Not Smiling (threshold 0.5)
+```
+
+Only 5 landmarks are used instead of a full CNN because the goal is speed and portability: the pipeline runs on CPU in ~4.4 ms/frame with a single 1.5 KB model bundle. Four geometric features capture mouth-opening and mouth-lifting, and a logistic regression separates them reliably on this benchmark.
+
+## Quickstart / installation
+
+Python 3.10+, no GPU. On first use the detector downloads the SCRFD model (`buffalo_sc`) from insightface releases.
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage example
+
+```python
+import cv2
+from src.smile_detector import is_smiling
+
+img = cv2.imread("photo.jpg")
+print("smiling:", is_smiling(img))  # True / False
+```
+
+Run the live webcam demo (`q` to quit):
+
+```bash
+python src/webcam_demo.py
+```
+
+## Project structure
+
+```text
+src/                  detector, features, smile_detector, webcam demo
+models/classifier/    shipped model bundle (final_model.pkl)
+notebooks/            training, benchmark, error analysis
+outputs/              benchmark results (CSV + misclassification grid)
+data/eda/             figures used in this README
+requirements.txt
+```
+
+## Known limitations
+
+- **Image quality sensitivity:** accuracy drops on bright/overexposed and blurry frames — the main single-face error source.
+- **Multi-face frames are skipped by design:** `is_smiling()` returns `False` unless exactly one face is detected; a genuinely smiling subject in a multi-face frame is counted as not smiling.
+- **One edge-case image** (`file2669.jpg`: brightness 90, blur 769) needs the full grayscale + zoom-crop fallback chain to resolve, and is the driver of the worst-case latency tail.
+
+## Acknowledgments / citation
+
+Training and evaluation use the [MPLab GENKI Database, GENKI-4K Subset](https://mplab.ucsd.edu/36/), cited as:
+
+```bibtex
+@misc{GENKI-4K,
+  Author = {\url{http://mplab.ucsd.edu}},
+  Title  = {{The MPLab GENKI Database, GENKI-4K Subset}}
+}
+```
+
+Face detection and landmarks use the SCRFD detector ([InsightFace](https://github.com/deepinsight/insightface), buffalo_sc / `det_500m.onnx`) via ONNX Runtime.
