@@ -35,14 +35,14 @@ Measured on the complete 823-image delivery set (795 single-face images the clas
 
 | Metric | Value | vs. Target |
 |---|---|---|
-| Accuracy | **86.63%** | +5.4 points over target |
-| Precision | **90.67%** | 9 in 10 "smiling" calls are correct |
-| Recall | **84.22%** | 8.4 in 10 real smiles are caught |
-| F1 | **87.33%** | Balanced precision/recall |
-| Latency (median) | **~4.1 ms** | Comfortably under 4.7 ms |
-| Latency (p95) | **~5.2–5.7 ms** | Exceeds target under system load — see [limitations](#known-limitations) |
+| Accuracy | **86.51%** | +5.3 points over target |
+| Precision | **90.65%** | 9 in 10 "smiling" calls are correct |
+| Recall | **84.00%** | 8.4 in 10 real smiles are caught |
+| F1 | **87.20%** | Balanced precision/recall |
+| Latency (median) | **~4.4 ms** | Comfortably under 4.7 ms |
+| Latency (p95) | **~5.5–8.4 ms** | Load-sensitive — see [limitations](#known-limitations) |
 
-*Source: `outputs/benchmark_summary.csv`, model bundle `models/classifier/final_model.pkl`.*
+*Source: `outputs/benchmark_summary.csv` (just-regenerated run), model bundle `models/classifier/final_model.pkl`.*
 
 ---
 
@@ -80,15 +80,16 @@ Landmarks are also passed through a **similarity alignment** step before feature
 Every plausible classifier was benchmarked on the same held-out split, same 4 features, same random seed:
 
 | Model | Test F1 | Median latency | Note |
-|---|---|---|---|
-| DecisionTree (depth 4) | 0.897 | 0.22 ms | Statistically tied with LR (McNemar p = 0.74) |
+|---|---|---:|---|
 | **LogisticRegression** | **0.894–0.896** | **0.42–0.55 ms** | **Shipped** |
 | Threshold rule (`mouth_eye_ratio`) | 0.895 | <0.01 ms | Statistically tied with LR |
 | LinearSVC | 0.893 | 0.46 ms | Close behind |
-| CatBoost | 0.883–0.894 | 0.81–0.84 ms | Behind |
 | LightGBM | 0.887–0.891 | 1.0–1.6 ms | Behind |
 | XGBoost | 0.883 | 0.52 ms | Behind |
+| DecisionTree (depth 4) | 0.897 | 0.22 ms | Statistically tied with LR (McNemar p = 0.74) |
 | RandomForest | 0.887–0.891 | 19–71 ms | **Excluded — 40–170× slower than everything else** |
+
+*CatBoost was benchmarked and dropped from the pipeline during cleanup — it never beat the shipped model and added a heavyweight dependency for nothing.*
 
 ![Model leaderboard](data/eda/model_leaderboard.png)
 
@@ -200,13 +201,21 @@ img = cv2.imread("photo.jpg")
 print("smiling:", is_smiling(img))   # True / False
 ```
 
-**Live webcam demo** (press `q` to quit):
+**Live webcam demo** (press `q` to quit) — single live-camera entry point:
 
 ```bash
 python src/webcam_demo.py
 ```
 
-The live demo shows the detected face's bounding box and 5 landmarks, a smoothed smile probability (rolling average + hysteresis, to avoid flicker on borderline expressions), and the live detection confidence.
+By default a green centered square auto-sizes to the detected face and the smile verdict is only shown while the face sits inside it (keep your face in the box). It shows the 5 landmarks the model used, a smoothed smile probability (rolling average + hysteresis, to avoid flicker on borderline expressions), and the live detection confidence.
+
+Variants (one file, one code path):
+
+- `--no-square` — classic whole-frame view: check any single face anywhere in the frame and draw the face bounding box.
+- `--raw` — remove stabilization and label the instantaneous probability per frame (A/B control).
+- `--threshold F` / `--debounce K` — experiment with the decision layer.
+- `--strict` / `--fixed` / `--square-frac F` — square-gate rule controls.
+- `--log PATH` — append a per-frame CSV to `data/exper/` for analysis.
 
 ---
 
@@ -214,23 +223,25 @@ The live demo shows the detected face's bounding box and 5 landmarks, a smoothed
 
 ```text
 src/
-  face_detector.py      SCRFD wrapper (provided, unmodified)
-  preprocessing.py       detection fallback (crop + grayscale retry)
-  features.py             geometric feature extraction + landmark alignment
-  smile_detector.py       is_smiling() — the deliverable
-  webcam_demo.py           live demo with keypoints, bbox, and smoothing
+  face_detector.py          SCRFD wrapper (provided, unmodified)
+  preprocessing.py          detection fallback (crop + grayscale retry)
+  features.py               geometric feature extraction + landmark alignment
+  smile_detector.py         is_smiling() — the deliverable
+  webcam_demo.py            live demo: square-gated by default, --no-square for whole-frame view
 models/classifier/
-  final_model.pkl          shipped model bundle (scaler + LogisticRegression + threshold)
+  final_model.pkl           shipped model bundle (scaler + LogisticRegression + threshold)
 notebooks/
   01_data_prep.ipynb        dataset loading and label correction
-  02_eda.ipynb                brightness/blur/detection-score exploration
+  02_eda.ipynb              brightness/blur/detection-score exploration
   03_feature_engineering.ipynb   feature design and separability analysis
-  04_modeling.ipynb              model leaderboard and selection
+  04_modeling.ipynb         model leaderboard and selection
   05_deployment_benchmark.ipynb  end-to-end accuracy and latency benchmark
 outputs/
   benchmark_results.csv, benchmark_summary.csv
 data/eda/
   every figure referenced in this README
+data/exper/
+  square_detect_log.csv     per-frame log of the square-gated experiment
 requirements.txt
 ```
 

@@ -1,40 +1,87 @@
-"""Live webcam demo: classify each frame with is_smiling() and overlay result + latency
-plus the 5 face landmarks (kps) the model used, drawn live with short tags.
+"""Live webcam demo: classify each frame with the shipped smile pipeline and
+overlay result + latency plus the 5 face landmarks (kps) the model used.
 
-The on-screen verdict is stabilised against per-frame flicker: the raw smile
-predict_proba is smoothed over a rolling 5-frame window and decided with
-hysteresis (up-threshold T+0.05 / down-threshold T-0.05 around T=0.5), instead
-of thresholding the instantaneous probability on every frame.
+This is the SINGLE live-camera entry point. It contains the two previously
+separate behaviors behind one flag set:
 
-When a single face is detected but with low detector confidence (det_score < 0.6)
-the verdict is withheld: the last stable result is held on screen with a yellow
-border signalling that it is not from the current frame.
+  * DEFAULT — the GATED view: a green centered square auto-sizes to the detected
+    face and the smile verdict is only produced while the face sits inside it.
+    A user instructed to "put your face in the box" holds still, centered and at
+    roughly constant scale — exactly the regime the 5-landmark geometric
+    features were measured in (GENKI-4K portraits). The square is the only box
+    drawn (no face bounding box): its edge mirrors the face's size.
+  * `--no-square` — the classic whole-frame view: the smile check runs on any
+    single face anywhere in the frame, and the detected face bounding box IS
+    drawn.
 
-The display is decoupled from the capture resolution: the window is created
-resizable at 1280x720 and each frame is upscaled (never downscaled) to at least
-1280x720 before drawing, so the on-screen size is guaranteed regardless of the
-resolution the camera actually delivers."""
+Both views run the identical pipeline (detection -> align -> 4 features ->
+LogisticRegression) and the same decision layer (see below). There is no code
+duplication between them — they are two branches of one loop.
 
+DECISION LAYER (identical for both views; the model and features are untouched):
+  * The raw smile predict_proba is smoothed over a rolling 5-frame window and
+    decided with hysteresis (bands T+0.05 / T-0.05 around the cut), so
+    borderline expressions don't flicker.
+  * Default cut T = the production operating point (0.5 for the sklearn bundle).
+  * --threshold raises/lowers the cut; --debounce K switches to debounced
+    switching (flip only after K consecutive frames agree — safe against
+    single-frame spikes, but adds response latency); --raw removes EVERYTHING
+    and labels the instantaneous probability each frame (A/B control).
+
+SAFETY:
+  * When there is no usable single face inside the gate the verdict is withheld
+    (the screen says why).
+  * When the single-face detection confidence drops below 0.6 the verdict is
+    held: the last stable result stays on screen with a yellow border saying
+    it is not from the current frame.
+
+LOGGING (optional, off by default): `--log PATH` appends one CSV row per frame
+with frame_idx, n_faces, det_score, in-square/gate state, raw & smoothed
+probabilities, the verdict, latency and the bbox/kps arrays — every flush
+per frame, so an interrupted run loses nothing.
+
+Display is decoupled from the capture resolution: the window is resizable at
+1280x720 and each frame is upscaled (never downscaled) to at least 1280x720
+before drawing, so the on-screen size is guaranteed regardless of the
+resolution the camera actually delivers.
+
+Keys: 'q' quit, 'c' reset the smoothed/verdict state.
+"""
+
+import argparse
+import csv
 import signal
 import sys
 import time
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from features import align_kps
-from smile_detector import detect_and_score_detailed
+from smile_detector import detect_and_score_detailed, _BUNDLE
 
-# SCRFD landmark order (matches features.py): left eye, right eye, nose,
-# left mouth corner, right mouth corner.
+# The default decision threshold follows the loaded bundle: for an sklearn
+# bundle it is the production 0.5 probability cut; for a threshold bundle the
+# rule decides on a single aligned feature directly (e.g. mouth_eye_ratio >=
+# 0.8357). --threshold overrides it.
+SMILE_THRESHOLD = (
+    float(_BUNDLE["model"])
+    if _BUNDLE["type"] == "threshold"
+    else 0.5
+)
+
 KPS_TAGS = ["LE", "RE", "N", "LM", "RM"]
-KPS_COLOR = (255, 255, 0)  # satured cyan (BGR) keypoint dots
-BBOX_COLOR = (255, 255, 200)  # light cyan-white (BGR) — distinct from dots and text
+KPS_COLOR = (255, 255, 0)        # keypoint dots (cyan)
+BBOX_COLOR = (255, 255, 200)     # face bbox (light cyan-white) — whole-frame view
 BBOX_THICKNESS = 2
+SQUARE_COLOR = (0, 255, 0)       # gate square (green)
+SQUARE_FILL = (0, 255, 0)        # face inside -> faint green wash over the square
+SQUARE_FILLED_ALPHA = 0.12
+GATE_COLOR = (0, 165, 255)       # orange — waiting for the face to enter the square
 
 # Stabilisation knobs (the underlying model/classification is not modified).
-SMILE_THRESHOLD = 0.5      # model's predict_proba decision point
 SMILE_HYSTERESIS = 0.05    # hold band: keep label inside [T-0.05, T+0.05]
 WINDOW_SIZE = 5            # rolling average length for the smoothed decision
 DET_CONF_THRESHOLD = 0.6   # hold result when the single-face det_score drops below this
@@ -43,14 +90,21 @@ HOLD_COLOR = (0, 255, 255)  # yellow (BGR) frame border for the hold indicator
 # Requested capture resolution (webcams may not honour it exactly).
 CAM_WIDTH, CAM_HEIGHT = 1280, 720
 
-# Display is decoupled from the capture resolution: the window is forced to
-# (at least) this size and every frame is upscaled to fit, so the image on
-# screen stays 1280x720 regardless of what the camera actually delivers.
+# Display is decoupled from the capture resolution (see module docstring).
 DISPLAY_WIDTH, DISPLAY_HEIGHT = 1280, 720
 WINDOW_TITLE = "Smile Detection"
 
+EXP_DIR = Path(__file__).resolve().parents[1] / "data" / "exper"
+DEFAULT_LOG = EXP_DIR / "webcam_demo_log.csv"
+LOG_HEADER = [
+    "frame_idx", "timestamp_ms", "n_faces", "det_score",
+    "face_in_square", "gate_open", "raw", "smoothed", "verdict",
+    "latency_ms", "bbox", "kps",
+]
 
-def _hysteresis_verdict(smoothed: float | None, prev: bool) -> bool:
+
+def _hysteresis_verdict(smoothed: float | None, prev: bool,
+                        threshold: float) -> bool:
     """Map the smoothed probability to a label with a hold band.
 
     Flipping to True only when ``smoothed > T + 0.05``, to False only when
@@ -59,27 +113,37 @@ def _hysteresis_verdict(smoothed: float | None, prev: bool) -> bool:
     """
     if smoothed is None:
         return prev
-    if smoothed > SMILE_THRESHOLD + SMILE_HYSTERESIS:
+    if smoothed > threshold + SMILE_HYSTERESIS:
         return True
-    if smoothed < SMILE_THRESHOLD - SMILE_HYSTERESIS:
+    if smoothed < threshold - SMILE_HYSTERESIS:
         return False
     return prev
 
 
-def _status_overlay(n_faces: int, verdict: bool) -> tuple[str, tuple[int, int, int], bool]:
-    """Return (label, BGR color, show_probability_lines) for the main label.
+def _bbox_in_square(bbox: np.ndarray, x1s: int, y1s: int, x2s: int, y2s: int,
+                    strict: bool) -> bool:
+    """True iff *bbox* (x1,y1,x2,y2) satisfies the centered-square rule."""
+    if bbox is None or len(bbox) != 4:
+        return False
+    bx1, by1, bx2, by2 = (float(v) for v in bbox)
+    if not all(np.isfinite(v) for v in (bx1, by1, bx2, by2)):
+        return False
+    cx = (bx1 + bx2) / 2.0
+    cy = (by1 + by2) / 2.0
+    if strict:
+        return bx1 >= x1s and by1 >= y1s and bx2 <= x2s and by2 <= y2s
+    return (x1s <= cx <= x2s) and (y1s <= cy <= y2s)
 
-    is_smiling() returns False identically for no-face, multi-face, and
-    genuine "not smiling" — so the screen distinguishes them: no face is shown
-    in gray, multiple faces in yellow, and a single face uses the smile verdict
-    (SMILING green / NOT SMILING red). The probability lines are only
-    meaningful when there is exactly one face to score.
-    """
-    if n_faces == 0:
-        return "NO FACE", (128, 128, 128), False
-    if n_faces >= 2:
-        return "MULTIPLE FACES", (0, 255, 255), False
-    return ("SMILING" if verdict else "NOT SMILING"), (0, 255, 0) if verdict else (0, 0, 255), True
+
+def _draw_square(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                 face_in: bool) -> None:
+    """Draw the centered gate square; faint green fill when a face is inside."""
+    if face_in:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), SQUARE_FILL, -1)
+        cv2.addWeighted(overlay, SQUARE_FILLED_ALPHA, frame, 1 - SQUARE_FILLED_ALPHA,
+                        0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), SQUARE_COLOR, 2, cv2.LINE_AA)
 
 
 def _draw_bbox(frame: np.ndarray, bbox: np.ndarray) -> None:
@@ -94,26 +158,6 @@ def _draw_bbox(frame: np.ndarray, bbox: np.ndarray) -> None:
     if not (0 <= pt1[0] < frame.shape[1] and 0 <= pt1[1] < frame.shape[0]):
         return
     cv2.rectangle(frame, pt1, pt2, BBOX_COLOR, BBOX_THICKNESS, cv2.LINE_AA)
-
-
-def _draw_face_label(frame: np.ndarray, bbox: np.ndarray, label: str,
-                     color: tuple[int, int, int], scale: float = 1.0) -> None:
-    """Draw *label* just above the top edge of *bbox*, outlined for readability."""
-    if bbox is None or len(bbox) != 4:
-        return
-    x1 = float(bbox[0])
-    y1 = float(bbox[1])
-    if not (np.isfinite(x1) and np.isfinite(y1)):
-        return
-    thickness = 3 if scale >= 1.0 else 2
-    (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-    # Anchor the text box so it sits above the face box, clamped to the frame.
-    tx = int(round(max(1, min(x1, frame.shape[1] - tw - 1))))
-    ty = int(round(max(th + 4, y1 - 8)))
-    # Dark backing panel so the label stays readable over bright regions.
-    cv2.rectangle(frame, (tx - 3, ty - th - 3),
-                  (tx + tw + 3, ty + 3), (0, 0, 0), -1)
-    cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 
 def _draw_kps(frame: np.ndarray, kps: np.ndarray) -> None:
@@ -135,7 +179,8 @@ def _draw_aligned(frame: np.ndarray, aligned: np.ndarray) -> None:
     if aligned is None:
         return
     h, w = frame.shape[:2]
-    lines = [f"{tag}: " + ",".join(f"{c:+.3f}" for c in pt) for tag, pt in zip(KPS_TAGS, aligned)]
+    lines = [f"{tag}: " + ",".join(f"{c:+.3f}" for c in pt)
+             for tag, pt in zip(KPS_TAGS, aligned)]
     y0 = 40
     line_h = 22
     panel_h = line_h * len(lines) + 10
@@ -146,7 +191,63 @@ def _draw_aligned(frame: np.ndarray, aligned: np.ndarray) -> None:
                     0.55, (255, 255, 200), 1, cv2.LINE_AA)
 
 
+def _draw_status(frame: np.ndarray, text: str, color: tuple[int, int, int],
+                 y: int = 40) -> None:
+    cv2.putText(frame, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+
+
+def _draw_face_label(frame: np.ndarray, bbox: np.ndarray, label: str,
+                     color: tuple[int, int, int], scale: float = 1.0) -> None:
+    """Draw *label* just above the top edge of *bbox*, outlined for readability."""
+    if bbox is None or len(bbox) != 4:
+        return
+    x1 = float(bbox[0])
+    y1 = float(bbox[1])
+    if not (np.isfinite(x1) and np.isfinite(y1)):
+        return
+    thickness = 3 if scale >= 1.0 else 2
+    (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    tx = int(round(max(1, min(x1, frame.shape[1] - tw - 1))))
+    ty = int(round(max(th + 4, y1 - 8)))
+    cv2.rectangle(frame, (tx - 3, ty - th - 3),
+                  (tx + tw + 3, ty + 3), (0, 0, 0), -1)
+    cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Live smile demo (single file): centered square gate by "
+                    "default; --no-square for the classic whole-frame view.")
+    ap.add_argument("--no-square", action="store_true",
+                    help="classic view: check any single face anywhere in the frame "
+                         "and draw the face bounding box (no centered gate)")
+    ap.add_argument("--square-frac", type=float, default=0.3,
+                    help="fallback square side as a fraction of frame width when no "
+                         "face is detected (default 0.3). Ignored while a face is "
+                         "present: the square auto-sizes to the detected face.")
+    ap.add_argument("--fixed", action="store_true",
+                    help="keep the square at --square-frac regardless of the face size")
+    ap.add_argument("--strict", action="store_true",
+                    help="require the WHOLE face bbox inside the square, not just its center")
+    ap.add_argument("--raw", action="store_true",
+                    help="remove stabilization: verdict = the instantaneous prediction "
+                         "thresholded per frame (A/B control)")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="override the decision threshold (default: the bundle's "
+                         "production operating point, e.g. 0.5)")
+    ap.add_argument("--debounce", type=int, default=0,
+                    help="flip only after this many consecutive frames agree "
+                         "(0 = hysteresis, the default)")
+    ap.add_argument("--log", nargs="?", const=str(DEFAULT_LOG), default=None,
+                    help="append per-frame rows to <path> for analysis "
+                         "(default path: %s)" % DEFAULT_LOG)
+    args = ap.parse_args()
+    if not 0.1 <= args.square_frac <= 0.9:
+        ap.error("--square-frac must be in [0.1, 0.9]")
+    if args.debounce < 0:
+        ap.error("--debounce must be >= 0")
+    threshold = SMILE_THRESHOLD if args.threshold is None else args.threshold
+
     stop = False
 
     def _request_stop(_signum, _frame):
@@ -165,6 +266,7 @@ def main() -> int:
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
     print(f"After set : W={cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f} "
           f"H={cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}")
     got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -174,129 +276,210 @@ def main() -> int:
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_TITLE, DISPLAY_WIDTH, DISPLAY_HEIGHT)
 
-    print("Press 'q' to quit.")
+    log = writer = None
+    if args.log:
+        Path(args.log).parent.mkdir(parents=True, exist_ok=True)
+        new_file = not Path(args.log).exists()
+        log = open(args.log, "a", newline="", encoding="utf-8")
+        writer = csv.DictWriter(log, fieldnames=LOG_HEADER)
+        if new_file:
+            writer.writeheader()
+        log.flush()
+
     window = deque(maxlen=WINDOW_SIZE)  # rolling raw probabilities
     verdict = False                     # previous displayed label (NOT SMILING)
-    # cv2's Qt windows overwrite the default SIGINT/SIGTERM dispositions and
-    # park them at SIG_IGN while the loop runs; re-arm Python's handlers every
-    # frame so Ctrl-C / `kill` cleanly release the camera instead of leaving a
-    # stuck process holding /dev/video0.
+    up_count = 0                        # debounce: consecutive frames >= threshold
+    down_count = 0                      # debounce: consecutive frames < threshold
+    frame_idx = 0
+
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
+    print("Press 'q' to quit, 'c' to reset the smoothed verdict.")
     while not stop:
         ok, frame = cap.read()
         if not ok or frame is None:
             print("WARNING: failed to read frame, skipping")
             continue
 
+        # Display is decoupled from capture: upscale to at least 1280x720. All
+        # detection/overlays below therefore run in DISPLAY coordinates.
+        orig_h, orig_w = frame.shape[:2]
+        disp_w, disp_h = max(orig_w, DISPLAY_WIDTH), max(orig_h, DISPLAY_HEIGHT)
+        if (disp_w, disp_h) != (orig_w, orig_h):
+            frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+
+        # Square fallback geometry (recomputed from the face below when visible).
+        side = int(round(args.square_frac * disp_w))
+        x1s, y1s = (disp_w - side) // 2, (disp_h - side) // 2
+        x2s, y2s = x1s + side, y1s + side
+
         try:
             t0 = time.perf_counter()
             _, kps, raw, n_faces, det_score, bbox = detect_and_score_detailed(frame)
             latency_ms = (time.perf_counter() - t0) * 1e3
         except Exception as err:
-            print(f"WARNING: is_smiling() failed on frame: {err!r}")
+            print(f"WARNING: pipeline failed on frame: {err!r}")
             continue
 
-        if kps is not None:
-            aligned = align_kps(kps)
+        aligned = align_kps(kps) if kps is not None else None
+
+        # Auto-size the centered square to the face so the gate "just fits" it.
+        if not args.no_square and not args.fixed and bbox is not None and len(bbox) == 4:
+            bx1, by1, bx2, by2 = (float(v) for v in bbox)
+            if all(np.isfinite(v) for v in (bx1, by1, bx2, by2)) and (bx2 - bx1) > 0:
+                side = int(round(max(bx2 - bx1, by2 - by1)))
+                x1s, y1s = (disp_w - side) // 2, (disp_h - side) // 2
+                x2s, y2s = x1s + side, y1s + side
+
+        # Gate: in the square view the verdict requires a single face whose
+        # bbox satisfies the square rule; in the classic view any single face
+        # (anywhere) qualifies — one code path, one branch.
+        if args.no_square:
+            in_square = n_faces == 1
         else:
-            aligned = None
+            in_square = _bbox_in_square(bbox, x1s, y1s, x2s, y2s, args.strict)
+        gate_open = (n_faces == 1 and in_square)
+        hold_active = (not args.raw and gate_open and det_score is not None
+                       and det_score < DET_CONF_THRESHOLD)
 
-        # Upscale the display frame to at least 1280x720 (never downscale) so
-        # the window size is decoupled from what the camera captures. Keypoints
-        # are scaled by the same factor to stay aligned with the face.
-        orig_h, orig_w = frame.shape[:2]
-        disp_w, disp_h = max(orig_w, DISPLAY_WIDTH), max(orig_h, DISPLAY_HEIGHT)
-        if (disp_w, disp_h) != (orig_w, orig_h):
-            frame = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
-            if kps is not None:
-                sx, sy = disp_w / orig_w, disp_h / orig_h
-                kps = kps.copy()
-                kps[:, 0] *= sx
-                kps[:, 1] *= sy
-            if bbox is not None:
-                sx, sy = disp_w / orig_w, disp_h / orig_h
-                bbox = bbox.copy().astype(float)
-                bbox[0] *= sx
-                bbox[1] *= sy
-                bbox[2] *= sx
-                bbox[3] *= sy
+        # Decision layer — identical regardless of view.
+        if args.raw:
+            if gate_open and raw is not None:
+                verdict = bool(raw >= threshold)
+            elif gate_open and raw is None:
+                verdict = False
+            window.clear()
+            smoothed = raw
+        else:
+            if not hold_active and gate_open and raw is not None:
+                window.append(raw)
+            smoothed = float(np.mean(window)) if window else None
 
-        _draw_bbox(frame, bbox)
+            # Fresh decision state every time the gate re-opens, so one
+            # attempt's history never leaks into the next.
+            if not gate_open:
+                up_count = 0
+                down_count = 0
 
+            if args.debounce > 0 and gate_open and not hold_active and raw is not None:
+                if smoothed is not None and smoothed >= threshold:
+                    up_count += 1
+                    down_count = 0
+                elif smoothed is not None:
+                    down_count += 1
+                    up_count = 0
+                if up_count >= args.debounce:
+                    verdict = True
+                elif down_count >= args.debounce:
+                    verdict = False
+            elif gate_open and raw is not None:
+                verdict = _hysteresis_verdict(smoothed, verdict, threshold)
+            elif gate_open and raw is None:
+                verdict = False
+
+        if writer is not None:
+            writer.writerow({
+                "frame_idx": frame_idx, "timestamp_ms": f"{time.time() * 1e3:.1f}",
+                "n_faces": n_faces, "det_score": f"{det_score:.4f}" if det_score is not None else "",
+                "face_in_square": int(in_square), "gate_open": int(gate_open),
+                "raw": f"{raw:.4f}" if raw is not None else "",
+                "smoothed": f"{smoothed:.4f}" if smoothed is not None else "",
+                "verdict": int(verdict),
+                "latency_ms": f"{latency_ms:.2f}",
+                "bbox": "" if bbox is None else np.array2string(np.asarray(bbox, dtype=float), precision=1),
+                "kps": "" if kps is None else np.array2string(np.asarray(kps, dtype=float), precision=1),
+            })
+            log.flush()  # interrupted run (Ctrl-C / crash) never loses the tail
+            frame_idx += 1
+
+        # Overlays — always landmarks + aligned panel; the box differs by view.
+        if not args.no_square:
+            _draw_square(frame, x1s, y1s, x2s, y2s, gate_open)
+        elif bbox is not None:
+            _draw_bbox(frame, bbox)
         if kps is not None:
             _draw_kps(frame, kps)
         _draw_aligned(frame, aligned)
 
-        # Faces count from the same detection result driving classification, so
-        # the screen shows why the smile check was skipped when count != 1
-        # (is_smiling returns False for both, but the reason distinguishes
-        # "genuinely not smiling" from "couldn't check").
-        if n_faces != 1:
-            reason = "no face" if n_faces == 0 else "multiple faces, skipping"
-            faces_line = f"Faces detected: {n_faces} — {reason}"
-        else:
-            faces_line = f"Faces detected: {n_faces}"
-
-        # Low-confidence guard: a single face whose detection score is below the
-        # floor is unreliable — withhold the update and keep showing the last
-        # stable result (window, smoothed value and verdict all stay frozen).
-        hold_active = (
-            n_faces == 1
-            and det_score is not None
-            and det_score < DET_CONF_THRESHOLD
-        )
-
-        # Rolling average of the raw smile probability (frames without a usable
-        # single face contribute no sample — the window holds what it has).
-        if not hold_active and raw is not None:
-            window.append(raw)
-        smoothed = float(np.mean(window)) if window else None
-
-        # No usable single face -> cannot check the smile: show NOT SMILING and
-        # the reason line above.  Otherwise decide on the smoothed value with
-        # hysteresis to avoid flicker around the 0.5 boundary.  A held frame
-        # skips this entirely, preserving the previous verdict.
-        if not hold_active:
-            if raw is not None:
-                verdict = _hysteresis_verdict(smoothed, verdict)
+        # Status text and probability lines. In both views the smile verdict
+        # (and its probabilities) only make sense while gate_open — exactly one
+        # face inside the gate — so they share this one branch.
+        if not gate_open:
+            if args.no_square:
+                reason = ("NO FACE" if n_faces == 0
+                          else "MULTIPLE FACES" if n_faces >= 2
+                          else "NO FACE")
+                _draw_status(frame, reason, (128, 128, 128))
+                detail = (f"Faces detected: {n_faces} — "
+                          + ("no face" if n_faces == 0
+                             else "multiple faces, skipping"))
+                cv2.putText(frame, detail, (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (255, 255, 255), 2)
             else:
-                verdict = False
-
-        label, color, show_prob = _status_overlay(n_faces, verdict)
-        # Full-frame status (NO FACE / MULTIPLE FACES) stays at the corner;
-        # the smile verdict is anchored to the face box so it follows the face.
-        if n_faces == 1 and bbox is not None:
-            _draw_face_label(frame, bbox, label, color, scale=1.0)
+                reason = ("NO FACE" if n_faces == 0
+                          else "MULTIPLE FACES" if n_faces >= 2
+                          else "STEP INTO THE SQUARE")
+                _draw_status(frame, reason, GATE_COLOR)
+                cv2.putText(frame, f"Faces detected: {n_faces}", (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         else:
-            cv2.putText(frame, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2, color, 3)
+            label = "SMILING" if verdict else "NOT SMILING"
+            color = (0, 255, 0) if verdict else (0, 0, 255)
+            if args.no_square and bbox is not None:
+                _draw_face_label(frame, bbox, label, color, scale=1.0)
+            else:
+                _draw_status(frame, label, color)
+            if raw is not None:
+                cv2.putText(frame, f"raw: {raw:.2f}", (20, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                if args.raw:
+                    cv2.putText(frame, "MODE=RAW (no smoothing)", (20, 160),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                else:
+                    cv2.putText(frame, f"smoothed: {smoothed:.2f}" if smoothed is not None
+                                else "smoothed: --", (20, 160),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    if args.debounce > 0:
+                        cv2.putText(frame, f"debounce: {up_count}/{args.debounce} "
+                                    f"(down {down_count})", (20, 200),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        cv2.putText(frame, faces_line, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"{latency_ms:.1f} ms", (20, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        # Probability lines only make sense with a single face to score; when
-        # there are 0 or 2+ faces there is nothing to score, so skip them.
-        if show_prob:
-            raw_line = f"raw: {raw:.2f}" if raw is not None else "raw: --"
-            smoothed_line = f"smoothed: {smoothed:.2f}" if smoothed is not None else "smoothed: --"
-            cv2.putText(frame, raw_line, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(frame, smoothed_line, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(frame, f"{latency_ms:.1f} ms", (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        size_src = f"fixed {args.square_frac:.2f} frame" if args.fixed else "auto = face size"
+        if args.raw:
+            mode_tag = "MODE=RAW"
+        elif args.debounce > 0:
+            mode_tag = f"MODE=DEBOUNCE K={args.debounce}"
+        else:
+            mode_tag = "MODE=HYST"
+        if args.no_square:
+            mode_tag += " WHOLE-FRAME"
+        cv2.putText(frame, f"square = {side}px [{size_src}] "
+                    f"{'strict' if args.strict else 'center'} | {mode_tag}",
+                    (20, disp_h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, SQUARE_COLOR, 2)
 
-        # Held frame: yellow border + note make it explicit the displayed verdict
-        # is the last stable one, not a judgement from this frame.
         if hold_active:
-            h, w = frame.shape[:2]
-            cv2.rectangle(frame, (0, 0), (w - 1, h - 1), HOLD_COLOR, 4)
-            cv2.putText(frame, "HELD (low-confidence detection)", (20, 240),
+            cv2.rectangle(frame, (0, 0), (disp_w - 1, disp_h - 1), HOLD_COLOR, 4)
+            cv2.putText(frame, "HELD (low-confidence detection)", (20, 280),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, HOLD_COLOR, 2)
 
         cv2.imshow(WINDOW_TITLE, frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
+        if key == ord("c"):
+            window.clear()
+            verdict = False
+            print("reset smoothed verdict")
 
+    if log is not None:
+        log.close()
     cap.release()
     cv2.destroyAllWindows()
+    if args.log:
+        print(f"Frame log appended to {args.log}")
     return 0
 
 

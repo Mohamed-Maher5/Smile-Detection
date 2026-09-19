@@ -32,10 +32,6 @@ __pycache__/
 # Runtime/detector model files (buffalo_sc ONNX assets downloaded at setup)
 livenees_models/
 
-# CatBoost training artifacts
-catboost_info/
-notebooks/catboost_info/
-
 # test / tooling caches
 .pytest_cache/
 .mypy_cache/
