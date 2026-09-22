@@ -1,4 +1,4 @@
-"""End-to-end smile detection: detector -> align -> features -> model.
+"""End-to-end smile detection: detector -> crop&refine -> align -> features -> model.
 
 Carries the Stage-4 decision from `04_modeling.ipynb`:
   Model     : LogisticRegression (C=0.1), trained on the 4 final aligned features
@@ -6,10 +6,20 @@ Carries the Stage-4 decision from `04_modeling.ipynb`:
   Decision  : predict_proba(smile) >= bundle threshold (0.5 when threshold is None)
   Test F1   : 0.8939 (precision 0.9067) on the held-out clean df_test (795);
               0.8733 on the full 823-image delivery set.
+
+Live pipeline notes:
+  * The single detected face is cropped out, upscaled to a canonical size and
+    re-detected on the crop alone (background removed, scale normalised) so the
+    5 landmarks are accurate at any distance — see REFINE_MIN_EDGE etc.
+  * Features are still the exact scale-invariant geometric features built from
+    ``align_kps``-aligned landmarks, normalised by the same StandardScaler the
+    model was trained on (identical preprocessing to training).
 """
 
 from pathlib import Path
+import os
 
+import cv2
 import numpy as np
 
 from face_detector import get_detector
@@ -26,6 +36,52 @@ _SCALER = _BUNDLE["scaler"]
 _FEATURES = list(_BUNDLE["features"])
 _BUNDLE_TYPE = _BUNDLE["type"]
 _THRESHOLD = _BUNDLE.get("threshold")
+
+# ── Crop-and-refine landmark stage ──────────────────────────────────────────
+# SCRFD landmark quality degrades for small faces (far from the camera) and
+# can be distracted by background.  After the coarse full-frame pass the single
+# face is cropped out, upscaled to a canonical size and detected again *on the
+# crop only*: the background is gone and the face fills the detector input, so
+# the 5 keypoints land more precisely at any distance/scale.  The crop is only
+# re-detected when it can actually help (face below the size at which landmarks
+# are already accurate, or a low-confidence detection); big high-quality faces
+# keep the single-pass path and its latency.
+REFINE_MIN_EDGE = 224          # upscale the crop so its smaller edge >= this
+REFINE_MARGIN = 0.06           # margin around the bbox (fraction of bbox size)
+REFINE_MAX_INTER_EYE = 140     # px: faces with inter-eye >= this skip the 2nd pass
+REFINE_MIN_DET_SCORE = 0.7     # below this the coarse detection is refined too
+
+# Latency escape hatch: set SMILE_NO_REFINE=1 (or flip at runtime) to fall back to
+# the single-pass path.  Single-pass is ~4.5 ms median per call but ~2pp less
+# accurate (0.8663 vs 0.8870 on the 823 benchmark); crop+refine is ~7.5 ms median —
+# still 26x inside the live 200 ms decision window (webcam_demo --fps 5).
+ENABLE_CROP_REFINE = os.environ.get("SMILE_NO_REFINE", "") != "1"
+
+
+def _refine_landmarks(image: np.ndarray, bbox, coarse_kps: np.ndarray) -> np.ndarray:
+    """Re-detect landmarks on an upscaled face crop; fall back to coarse on failure."""
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    bw, bh = x2 - x1, y2 - y1
+    if bw <= 0 or bh <= 0:
+        return coarse_kps
+    margin = REFINE_MARGIN * max(bw, bh)
+    cx1 = max(0, int(x1 - margin)); cy1 = max(0, int(y1 - margin))
+    cx2 = min(w, int(np.ceil(x2 + margin))); cy2 = min(h, int(np.ceil(y2 + margin)))
+    if cx2 - cx1 <= 0 or cy2 - cy1 <= 0:
+        return coarse_kps
+    crop = image[cy1:cy2, cx1:cx2]
+    cw, ch = crop.shape[1], crop.shape[0]
+    u = REFINE_MIN_EDGE / min(cw, ch)
+    if u > 1.0:
+        crop = cv2.resize(crop, (max(1, int(round(cw * u))), max(1, int(round(ch * u)))),
+                          interpolation=cv2.INTER_LINEAR)
+    refined = detect_with_fallback(get_detector(), crop)
+    if len(refined) != 1 or refined[0].kps is None:
+        return coarse_kps
+    kps_up = np.asarray(refined[0].kps, dtype=float)
+    kps_crop = kps_up / u if u > 1.0 else kps_up
+    return kps_crop + np.array([cx1, cy1], dtype=float)
 
 
 def _score_sample(feature_row: dict) -> tuple[bool, float | None]:
@@ -85,6 +141,10 @@ def detect_and_score_detailed(
     kps = faces[0].kps
     det_score = float(faces[0].det_score)
     bbox = faces[0].bbox
+    left_eye, right_eye = kps[0], kps[1]
+    inter_eye = float(np.hypot(right_eye[0] - left_eye[0], right_eye[1] - left_eye[1]))
+    if ENABLE_CROP_REFINE and (inter_eye < REFINE_MAX_INTER_EYE or det_score < REFINE_MIN_DET_SCORE):
+        kps = _refine_landmarks(image, bbox, kps)
     aligned_kps = align_kps(kps)
     pred, score = _score_sample(extract_features(aligned_kps))
     return pred, kps, score, n_faces, det_score, bbox
