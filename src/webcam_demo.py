@@ -18,12 +18,13 @@ previously separate behaviors behind one flag set:
     drawn.
 
 Both views run the IDENTICAL inference pipeline — detection (on the camera's
-NATIVE resolution) -> similarity face alignment (align_kps) -> the same 4
-geometric features -> the same StandardScaler normalization -> the same
-LogisticRegression as the model was trained on. Scaling for display happens
-only for drawing, never before detection; upscaling the image before
-detection measurably degrades SCRFD landmarks. There is no code duplication
-between the views — they are two branches of one loop.
+NATIVE resolution) -> similarity face alignment (align_kps) -> the same 3
+geometric features (mouth_width, mouth_vertical_lift, mouth_nose_ratio) -> the
+same StandardScaler normalization -> the same LogisticRegression as the model
+was trained on. Scaling for display happens only for drawing, never before
+detection; upscaling the image before detection measurably degrades SCRFD
+landmarks. There is no code duplication between the views — they are two
+branches of one loop.
 
 DECISION CADENCE (default 5 predictions per second): the camera captures at
 ~30 fps but the detect/classify step only runs on frames spaced ~1/--fps apart

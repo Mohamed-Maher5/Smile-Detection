@@ -31,18 +31,21 @@ This project has neither. The face detector — SCRFD, run directly via ONNX Run
 
 ## Results at a glance
 
-Measured on the complete 823-image delivery set (795 single-face images the classifier actually judges, plus 28 zero-face/multi-face frames that are automatically rejected by design). Target baseline, inherited from the previous dlib-based system: **81.2% accuracy, 4.7 ms/image latency**.
+Measured on the complete 823-image delivery set (795 single-face images the classifier actually judges, plus 28 multi-face frames that are automatically rejected by design). Target baseline, inherited from the previous dlib-based system: **81.2% accuracy, 4.7 ms/image latency**.
 
 | Metric | Value | vs. Target |
 |---|---|---|
-| Accuracy | **86.51%** | +5.3 points over target |
-| Precision | **90.65%** | 9 in 10 "smiling" calls are correct |
-| Recall | **84.00%** | 8.4 in 10 real smiles are caught |
-| F1 | **87.20%** | Balanced precision/recall |
-| Latency (median) | **~4.4 ms** | Comfortably under 4.7 ms |
-| Latency (p95) | **~5.5–8.4 ms** | Load-sensitive — see [limitations](#known-limitations) |
+| Accuracy | **88.70%** | +7.5 points over target |
+| Precision | **91.61%** | 9.2 in 10 "smiling" calls are correct |
+| Recall | **87.33%** | 8.7 in 10 real smiles are caught |
+| F1 | **89.42%** | Balanced precision/recall |
+| Latency (median, refined) | **~7.9 ms** | Past the legacy budget — the accuracy-optimal mode |
+| Latency (median, single-pass) | **~4.5 ms** | Meets the legacy budget, ~2 pp less accurate |
+| Latency (p95, refined) | **~9.5 ms** | Load-sensitive — see [limitations](#known-limitations) |
 
-*Source: `outputs/benchmark_summary.csv` (just-regenerated run), model bundle `models/classifier/final_model.pkl`.*
+The shipped pipeline runs a **crop-and-refine landmark stage** before classification (see [How it works](#how-it-works)) that lifts accuracy **~2.1 pp** over a single detector pass (88.70% vs 86.63% on the same 823 images) at ~7.9 ms median latency. Both modes sit well inside the **200 ms live decision window** of the webcam demo, and the fast mode is one switch away (`SMILE_NO_REFINE=1`, or the webcam demo's `--no-refine`).
+
+*Source: `outputs/benchmark_results.csv` / `benchmark_summary.csv` (final refined run), model bundle `models/classifier/final_model.pkl`.*
 
 ---
 
@@ -58,18 +61,19 @@ The fix is a **progressive fallback chain**: if the direct pass finds nothing, r
 
 ![Detection recovery examples](data/eda/detection_recovery_examples.png)
 
-### 2. Turning 5 points into 4 signals
+### 2. Turning 5 points into geometric features
 
 With no mouth outline available, the only usable geometry is **how wide the mouth is** and **how lifted its corners are**, both normalized against stable reference distances so they hold up regardless of face size or distance from the camera:
 
 | Feature | What it captures | Separability (Cohen's d) |
 |---|---|---|
-| `mouth_eye_ratio` | mouth width ÷ inter-eye distance | 2.33 |
-| `mouth_vertical_lift` | mouth-corner height relative to the eye line | 1.38 |
-| `mouth_nose_ratio` | mouth width ÷ nose-to-eye distance | 0.70 |
-| `mouth_width` | raw mouth-corner span | 0.62 |
+| `mouth_width` | mouth-corner span ÷ inter-eye distance | **2.30** |
+| `mouth_vertical_lift` | mouth-corner height relative to the eye line | **1.37** |
+| `mouth_nose_ratio` | mouth width ÷ nose-to-eye distance | **0.70** |
 
-Every feature is a ratio, not a raw distance (except `mouth_width`, kept for model-based candidates) — this makes them **scale-invariant by construction**: the same smile produces roughly the same feature values whether the face fills the frame or sits far from the camera.
+Every feature is a ratio, not a raw distance, which makes them **scale-invariant by construction**: the same smile produces roughly the same feature values whether the face fills the frame or sits far from the camera.
+
+A fourth candidate — a separately-named raw `mouth_eye_ratio` — was explored and turned out to be redundant: features are extracted **after** similarity alignment, which already normalizes the inter-eye distance to 1, so the raw mouth span `mouth_width` *is* the inter-eye ratio by construction (the two columns are numerically identical in the training data). The shipped model keeps **three** independent signals, not four.
 
 Landmarks are also passed through a **similarity alignment** step before feature extraction — rotating and scaling all 5 points so the eyes sit at fixed canonical positions. This costs about 70 microseconds per frame and provides free insurance against head roll, even though (see below) it didn't move the accuracy needle on this particular benchmark.
 
@@ -77,11 +81,11 @@ Landmarks are also passed through a **similarity alignment** step before feature
 
 ### 3. Choosing a model — and confirming there's nothing better
 
-Every plausible classifier was benchmarked on the same held-out split, same 4 features, same random seed:
+Every plausible classifier was benchmarked on the same held-out split, same 3 aligned features, same random seed:
 
 | Model | Test F1 | Median latency | Note |
 |---|---|---:|---|
-| **LogisticRegression** | **0.894–0.896** | **0.42–0.55 ms** | **Shipped** |
+| **LogisticRegression** | **0.894** | **0.42–0.55 ms** | **Shipped** (precision 0.907) |
 | Threshold rule (`mouth_eye_ratio`) | 0.895 | <0.01 ms | Statistically tied with LR |
 | LinearSVC | 0.893 | 0.46 ms | Close behind |
 | LightGBM | 0.887–0.891 | 1.0–1.6 ms | Behind |
@@ -126,15 +130,20 @@ Every verdict above is a McNemar exact-test statement, not a judgment call on th
 
 ![Confusion matrix](data/eda/confusion_matrix_final.png)
 
-On the held-out single-face test set: **TN 326 / FP 39 / FN 51 / TP 379**.
+On the held-out single-face test set (795 images, feature-level evaluation of the shipped model): **TN 326 / FP 39 / FN 51 / TP 379** — precision 0.907, recall 0.881.
 
-![Accuracy by brightness and blur](data/eda/error_by_brightness_blur.png)
+Breaking accuracy down by image-quality tercile on the 823-image end-to-end benchmark shows **no meaningful degradation from brightness or blur** — accuracy stays within a ~0.88–0.90 band across all six terciles:
 
-Breaking accuracy down by image quality tercile reveals the real weak point: **brightness, not blur**. Accuracy stays essentially flat across blur terciles (~0.88–0.90) but drops sharply in the brightest third of images (~0.86). Overexposed frames wash out the mouth-corner contrast the feature set depends on. Blur, somewhat counterintuitively, barely matters.
+| Quality tercile → | Low | Medium | High |
+|---|---:|---:|---:|
+| Brightness → accuracy | 0.884 | 0.876 | **0.902** |
+| Blur → accuracy | 0.880 | 0.891 | 0.891 |
 
-![Misclassified examples](data/eda/misclassified_examples.png)
+If anything, the *brightest* third of images is now the most accurate (0.902 vs ~0.88): the crop-and-refine landmark stage removed the overexposure weakness that earlier single-pass builds showed. Blur, somewhat counterintuitively, barely matters.
 
-There is also a **structural recall ceiling** that no classifier can remove: frames with zero or multiple detected faces are scored `False` by design (see [How it works](#how-it-works)). Among the 823 delivery images, 28 fall into this category — some of them genuine smiles that are correctly, deliberately never given a chance to be classified.
+![Misclassified examples](data/eda/misclassified_grid.png)
+
+There is also a **structural recall ceiling** that no classifier can remove: frames with multiple detected faces are scored `False` by design (see [How it works](#how-it-works)). Among the 823 delivery images, 28 are multi-face (2–3 faces; there are no zero-face frames in this delivery set) — 20 of them hold a genuine smile that is correctly, deliberately never given a chance to be classified.
 
 ---
 
@@ -158,12 +167,16 @@ SCRFD face detection (ONNX, CPU)
   ├─ 2+ faces ──► return False   (never guess which face to judge)
   │
   ▼  (exactly 1 face)
-Landmark alignment (rotate + scale → canonical eye positions)
+Crop-and-refine: re-detect on an upscaled face-only crop so the 5
+landmarks land precisely at any distance (skipped for big clear faces)
+  │
+  ▼
+Landmark alignment (rotate + scale → canonical eye frame, inter-eye = 1)
   │
   ▼
 Geometric feature extraction
-  │   mouth_eye_ratio · mouth_vertical_lift
-  │   mouth_nose_ratio · mouth_width
+  │   mouth_width   (mouth-corner span ÷ inter-eye — the mouth_eye_ratio)
+  │   mouth_vertical_lift · mouth_nose_ratio
   ▼
 StandardScaler → LogisticRegression (C=0.1)
   │
@@ -207,7 +220,7 @@ print("smiling:", is_smiling(img))   # True / False
 python src/webcam_demo.py
 ```
 
-By default a green centered square auto-sizes to the detected face and the smile verdict is only shown while the face sits inside it (keep your face in the box). It shows the 5 landmarks the model used, a smoothed smile probability (rolling average + hysteresis, to avoid flicker on borderline expressions), and the live detection confidence.
+By default a green centered square is **fixed in place** — it does not track the face — and the smile verdict is only shown while a single face sits centered inside it at an acceptable size (move into the box, don't expect the box to follow you). It shows the 5 landmarks the model used, a smoothed smile probability (rolling average + hysteresis, to avoid flicker on borderline expressions), and the live detection confidence.
 
 Variants (one file, one code path):
 
@@ -223,25 +236,28 @@ Variants (one file, one code path):
 
 ```text
 src/
-  face_detector.py          SCRFD wrapper (provided, unmodified)
+  face_detector.py          SCRFD wrapper (direct ONNX Runtime, downloads det_500m.onnx)
   preprocessing.py          detection fallback (crop + grayscale retry)
   features.py               geometric feature extraction + landmark alignment
-  smile_detector.py         is_smiling() — the deliverable
-  webcam_demo.py            live demo: square-gated by default, --no-square for whole-frame view
+  smile_detector.py         is_smiling() — the deliverable (detect → refine → align → classify)
+  webcam_demo.py            live demo: guided box by default, --no-square for whole-frame view
+  utils.py                  metrics / plotting helpers shared by the notebooks
+  test_smile.py             quick CLI smoke test: python src/test_smile.py photo.jpg ...
 models/classifier/
-  final_model.pkl           shipped model bundle (scaler + LogisticRegression + threshold)
+  final_model.pkl           shipped model bundle (StandardScaler + LogisticRegression, 3 features)
 notebooks/
   01_data_prep.ipynb        dataset loading and label correction
   02_eda.ipynb              brightness/blur/detection-score exploration
   03_feature_engineering.ipynb   feature design and separability analysis
   04_modeling.ipynb         model leaderboard and selection
   05_deployment_benchmark.ipynb  end-to-end accuracy and latency benchmark
+  06_error_bucket_analysis.ipynb  misclassified-image review + quality-tercile analysis
 outputs/
   benchmark_results.csv, benchmark_summary.csv
 data/eda/
   every figure referenced in this README
 data/exper/
-  square_detect_log.csv     per-frame log of the square-gated experiment
+  square_detect_log.csv     per-frame log of the guide-gated webcam experiment
 requirements.txt
 ```
 
@@ -249,9 +265,9 @@ requirements.txt
 
 ## Known limitations
 
-- **Overexposed images hurt accuracy** — the brightest tercile of images sees a real accuracy drop (~0.90 → ~0.86), since blown-out highlights wash out the mouth-corner contrast the features depend on.
-- **Multi-face and no-face frames always return `False`, by design** — this is correct, deliberate safety behavior, but it puts a hard ceiling on recall across any benchmark that includes such frames; no amount of model tuning can close this gap.
-- **Latency tail is load-sensitive.** Median latency comfortably beats the 4.7 ms target on every measured run; p95 latency occasionally exceeds it under system load, driven by the rare images that need the full detection fallback chain — not by the classifier itself, which runs in well under a millisecond.
+- **Accuracy is flat across image quality — the easy levers are spent.** Tercile analysis finds no meaningful drop from brightness or blur (accuracy stays within ~0.88–0.90; the brightest third is actually the *most* accurate at 0.902). Remaining gains have to come from the classifier, more data, or stronger landmark precision — not from image pre-processing.
+- **Multi-face frames always return `False`, by design** — correct, deliberate safety behavior, but it puts a hard ceiling on recall: 28 of the 823 delivery images are multi-face (20 of them genuinely smiling) and are never classified. No amount of model tuning can close this gap.
+- **Latency is mode-dependent.** The shipped crop-and-refine pipeline runs at ~7.9 ms median / ~9.5 ms p95 — past the legacy 4.7 ms dlib budget, but still ~25× inside the 200 ms live decision window. Setting `SMILE_NO_REFINE=1` (or the webcam demo's `--no-refine`) restores the ~4.5 ms single-pass mode at ~2 pp accuracy cost. The p95 tail is load-sensitive, driven by the rare images that need the full detection fallback chain — not by the classifier itself, which runs in well under a millisecond.
 - **Head yaw (turning, not tilting) isn't corrected.** Landmark alignment fixes head *roll*; a genuine left/right head turn foreshortens the face in ways a 2D similarity transform can't undo. This remains an open area for future work.
 
 ---

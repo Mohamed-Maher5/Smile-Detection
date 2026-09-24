@@ -35,3 +35,6 @@ livenees_models/
 # test / tooling caches
 .pytest_cache/
 .mypy_cache/
+
+# local tooling / worktree scratch (kilo, etc.)
+.kilo/

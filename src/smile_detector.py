@@ -1,11 +1,12 @@
 """End-to-end smile detection: detector -> crop&refine -> align -> features -> model.
 
 Carries the Stage-4 decision from `04_modeling.ipynb`:
-  Model     : LogisticRegression (C=0.1), trained on the 4 final aligned features
+  Model     : LogisticRegression (C=0.1), trained on the 3 final aligned features
   Scaler    : fitted StandardScaler (applied before inference)
   Decision  : predict_proba(smile) >= bundle threshold (0.5 when threshold is None)
   Test F1   : 0.8939 (precision 0.9067) on the held-out clean df_test (795);
-              0.8733 on the full 823-image delivery set.
+              0.8942 on the full 823-image delivery benchmark
+              (outputs/benchmark_summary.csv).
 
 Live pipeline notes:
   * The single detected face is cropped out, upscaled to a canonical size and
@@ -53,8 +54,8 @@ REFINE_MIN_DET_SCORE = 0.7     # below this the coarse detection is refined too
 
 # Latency escape hatch: set SMILE_NO_REFINE=1 (or flip at runtime) to fall back to
 # the single-pass path.  Single-pass is ~4.5 ms median per call but ~2pp less
-# accurate (0.8663 vs 0.8870 on the 823 benchmark); crop+refine is ~7.5 ms median —
-# still 26x inside the live 200 ms decision window (webcam_demo --fps 5).
+# accurate (0.8663 vs 0.8870 on the 823 benchmark); crop+refine is ~7.9 ms median —
+# still ~25x inside the live 200 ms decision window (webcam_demo --fps 5).
 ENABLE_CROP_REFINE = os.environ.get("SMILE_NO_REFINE", "") != "1"
 
 
@@ -162,7 +163,7 @@ def is_smiling(image: np.ndarray) -> bool:
     False when there are zero or more than one faces, no usable landmarks, or
     degenerate (NaN) features. The carried classifier is a C=0.1
     LogisticRegression + StandardScaler on
-    ['mouth_eye_ratio', 'mouth_vertical_lift', 'mouth_nose_ratio', 'mouth_width']
+    ['mouth_width', 'mouth_vertical_lift', 'mouth_nose_ratio']
     (threshold: predict_proba >= bundle threshold; 0.5 default).
     """
     return detect_and_score(image)[0]
